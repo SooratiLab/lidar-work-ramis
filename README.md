@@ -27,8 +27,7 @@ This repo continues that work in two directions:
 No Go2, Jetson, or Mid-360 has been reachable yet during this work --
 everything below has been verified either on x86_64 as a stand-in for the
 Jetson's aarch64, or against Kei's recorded bags standing in for a live
-sensor. That's a real constraint on what "verified" means here, not a
-minor caveat -- see each subdirectory's README for exactly what has and
+sensor. -- see each subdirectory's README for exactly what has and
 hasn't been tested.
 
 ## What's here
@@ -50,9 +49,3 @@ hasn't been tested.
   `perception/README.md`.
 - **Multi-dog map/track merging** -- not started yet, still at the
   planning stage.
-
-## Working notes
-
-Day-to-day working notes, decisions, and the task list live locally as
-`DOCS.md`/`TODO.md`/`AGENTS.md` (gitignored, not shown on GitHub) -- ask
-Ramis for the current working copy if picking this up without it.
