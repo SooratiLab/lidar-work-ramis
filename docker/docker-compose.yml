@@ -1,0 +1,60 @@
+services:
+  driver:
+    build: .
+    image: go2-lidar-humble:latest
+    container_name: go2-lidar-driver
+    # The Livox SDK binds directly to the host's LiDAR-subnet IP -- it
+    # doesn't go through Docker's usual NAT'd bridge network at all, so
+    # bridge networking fails with "bind failed" (confirmed while testing
+    # this image without a real 192.168.1.x interface present). Host
+    # networking is required, not just convenient.
+    network_mode: host
+    environment:
+      - LIVOX_LIDAR_IP=${LIVOX_LIDAR_IP:?set LIVOX_LIDAR_IP in .env -- copy .env.example first}
+      - LIVOX_HOST_IP=${LIVOX_HOST_IP:-192.168.1.50}
+    command: ["driver"]
+    restart: unless-stopped
+    profiles: ["hardware"]
+
+  fastlio:
+    image: go2-lidar-humble:latest
+    container_name: go2-fastlio
+    network_mode: host
+    command: ["fastlio"]
+    restart: unless-stopped
+    profiles: ["hardware", "replay"]
+
+  # Replay profile -- stands in for the live driver when no LiDAR/Jetson is
+  # reachable. Plays a recorded rosbag at (roughly) real-time rate against a
+  # live FastLIO instance, so the rest of the pipeline sees the same message
+  # stream/timing it would from a real sensor. Needs BAG_PATH set to a
+  # directory containing metadata.yaml + a .db3 file (e.g. one of Kei's
+  # recordings under kei-stuff/ros2-go2/bag/).
+  bag:
+    image: go2-lidar-humble:latest
+    container_name: go2-bag-replay
+    network_mode: host
+    volumes:
+      - ${BAG_PATH:?set BAG_PATH in .env to a rosbag2 directory}:/bag:ro
+    # Small delay so FastLIO's subscriber is up before the first message --
+    # matches the manual "wait for Node init finished" step in
+    # go2-jetson-setup.md; without it the bag's first IMU/LiDAR messages can
+    # arrive before FastLIO is subscribed and get silently dropped.
+    command: ["bash", "-c", "sleep 5 && ros2 bag play /bag"]
+    profiles: ["replay"]
+    depends_on:
+      - fastlio
+
+  # Online perception prototype -- subscribes to /cloud_registered +
+  # /Odometry live instead of batch-processing PCD files from disk. See
+  # perception/README.md for what it does and doesn't do yet.
+  perception:
+    image: go2-lidar-humble:latest
+    container_name: go2-online-perception
+    network_mode: host
+    volumes:
+      - ../perception:/opt/perception:ro
+    command: ["python3", "/opt/perception/online_perception_node.py"]
+    profiles: ["hardware", "replay"]
+    depends_on:
+      - fastlio

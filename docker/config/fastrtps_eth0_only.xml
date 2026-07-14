@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Restricts DDS discovery/data to loopback and the Jetson's two Ethernet
+  subnets (Go2 internal link + Livox link), so two dogs sharing a
+  non-enterprise WiFi network (go2-field, a phone hotspot) don't discover
+  each other's /livox/lidar publisher over multicast and cross-talk,
+  which drops scan rate from ~10 Hz to ~3 Hz. Enterprise WiFi (SOTON-IoT)
+  filters multicast, so the problem doesn't show up there -- don't assume
+  it's unnecessary just because a test on campus WiFi looked fine.
+
+  If either dog's Ethernet subnets ever change, update the whitelist below
+  to match.
+-->
+<profiles xmlns="http://www.eprosima.com/XMLSchemas/fastRTPS_Profiles">
+    <transport_descriptors>
+        <transport_descriptor>
+            <transport_id>no_wifi</transport_id>
+            <type>UDPv4</type>
+            <interfaceWhiteList>
+                <address>127.0.0.1</address>
+                <address>192.168.123.0/24</address>
+                <address>192.168.1.0/24</address>
+            </interfaceWhiteList>
+        </transport_descriptor>
+    </transport_descriptors>
+
+    <participant profile_name="default_participant" is_default_profile="true">
+        <rtps>
+            <userTransports>
+                <transport_id>no_wifi</transport_id>
+            </userTransports>
+            <useBuiltinTransports>false</useBuiltinTransports>
+        </rtps>
+    </participant>
+</profiles>
