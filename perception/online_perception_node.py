@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """
-online_perception_node.py -- live frame-to-frame motion detection on
-FastLIO's /cloud_registered + /Odometry, without going through PCD files
-on disk first.
+online_perception_node.py -- live frame-to-frame motion detection and
+centroid tracking on FastLIO's /cloud_registered + /Odometry, without going
+through PCD files on disk first.
 
 This is the streaming counterpart to
-lidar-perception/scripts/track_motion.py in kei-stuff. That script's
-pipeline is unchanged here -- accumulate scans into fixed-duration frames,
-diff consecutive frames, DBSCAN the moved points, match clusters across
-frames by nearest centroid, report velocity. What's different is that it
-runs against a live topic subscription instead of a folder of pre-exported
-PCD files, so it can run alongside a live sensor -- or, until one is
-reachable, a replayed bag standing in for one -- instead of after the fact.
+lidar-perception/scripts/track_motion.py in kei-stuff. The detection side
+of that pipeline is unchanged here -- accumulate scans into fixed-duration
+frames, diff consecutive frames, DBSCAN the moved points. The tracking side
+has moved on from that script's greedy nearest-centroid matching: this node
+uses a constant-velocity Kalman filter per track with globally-optimal
+(Hungarian) frame-to-frame assignment and a few frames of coasting through
+missed detections, instead of ending a track the instant one frame's
+detection is missing. See tracking.py for the full reasoning and pointcloud.py
+for the point cloud parsing/downsampling this feeds off.
 
 Coordinate units: metres throughout, matching ROS conventions and FastLIO's
 own /cloud_registered and /Odometry output directly. This deliberately does
 NOT convert to millimetres the way the offline pipeline's PCD files do (see
 export_fastlio.py in kei-stuff) -- there's no PCD file in this path to match
 units with, so there's no reason to introduce that convention here. Every
-distance parameter below (voxel size, thresholds, etc.) is in metres.
+distance parameter below (voxel size, thresholds, etc.) is in metres, every
+Kalman noise parameter documents its own units.
 
 Subscribes:
     /cloud_registered   (sensor_msgs/PointCloud2)
@@ -32,6 +35,11 @@ Publishes:
                                    sphere + one text label per active track,
                                    viewable in RViz2 against the same
                                    "camera_init" frame FastLIO publishes in.
+                                   Coasting tracks (predicted position, no
+                                   detection this frame) are drawn at
+                                   reduced opacity so it's visually obvious
+                                   when a track is being carried through a
+                                   gap rather than freshly confirmed.
 
 Parameters (all overridable via --ros-args -p <name>:=<value>):
     accumulate_scans     (int,   default 10)    scans merged per frame --
@@ -40,92 +48,82 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  for the offline equivalent
     voxel_size            (float, default 0.05)  downsample voxel size (m)
     change_threshold      (float, default 0.15)  moved-point distance (m)
-    cluster_eps           (float, default 0.5)   DBSCAN radius (m)
+    cluster_eps            (float, default 0.5)   DBSCAN radius (m)
     cluster_min_points    (int,   default 10)    DBSCAN min_samples
-    max_match_distance    (float, default 1.5)   track-matching radius (m)
+    max_match_distance    (float, default 1.5)   track-matching gate (m) --
+                                                 max distance between a
+                                                 track's predicted position
+                                                 and a detection centroid
+                                                 for them to be matched
+    max_missed_frames    (int,   default 3)     frames a track keeps
+                                                 coasting (predicted
+                                                 position, no detection)
+                                                 before it's dropped
+    kalman_position_std   (float, default 0.1)   assumed centroid
+                                                 measurement noise (m) --
+                                                 how much a single DBSCAN
+                                                 cluster's mean is trusted
+                                                 as a position estimate
+    kalman_velocity_std   (float, default 2.0)   initial velocity
+                                                 uncertainty (m/s) for a
+                                                 newly created track, before
+                                                 it has any motion history
+    kalman_process_std    (float, default 1.0)   assumed acceleration noise
+                                                 (m/s^2) -- how much
+                                                 unmodelled speeding up/
+                                                 slowing down/turning the
+                                                 constant-velocity model
+                                                 should expect between
+                                                 frames
     z_max                 (float, default 2.5)   ceiling crop height (m)
 
-Defaults match the FastLIO-tuned values in lidar-perception/README.md's
-track_motion.py parameter table (converted mm -> m), since that's the best
-available starting point for FastLIO's sparse, moving-sensor point density
--- not re-derived from scratch here. They are a starting point, not a
-guarantee; re-tune against whatever this node's actual frame density turns
-out to be once running against a live sensor (see DOCS.md).
+Defaults for the detection-side parameters match the FastLIO-tuned values in
+lidar-perception/README.md's track_motion.py parameter table (converted
+mm -> m), since that's the best available starting point for FastLIO's
+sparse, moving-sensor point density -- not re-derived from scratch here.
+They are a starting point, not a guarantee; re-tune against whatever this
+node's actual frame density turns out to be once running against a live
+sensor. The Kalman noise parameters are new and have no offline equivalent
+to carry over -- their defaults are reasoned from walking-pace human motion
+(see the module docstring above each one) and, like the detection
+parameters, should be revisited once more sessions have been run.
 """
+import colorsys
+import sys
+from pathlib import Path
+
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from scipy.spatial import cKDTree
 from sensor_msgs.msg import PointCloud2
 from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
-from sklearn.cluster import DBSCAN
-from scipy.spatial import cKDTree
+
+# Local, non-ROS modules living alongside this script -- see pointcloud.py
+# and tracking.py for what moved out of this file and why. Explicit
+# sys.path insert (rather than relying on the script's directory already
+# being first on sys.path) so this still works if the node is ever launched
+# via `python3 -m` or an entry point instead of run as a plain script,
+# matching the same defensive pattern kei-stuff/lidar-perception/scripts
+# already uses for its own local imports.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pointcloud import pointcloud2_to_xyz, voxel_downsample
+from tracking import CentroidTracker, cluster_moved_points
 
 
-# sensor_msgs/msg/PointField datatype constants -> numpy dtype characters.
-_POINTFIELD_TO_NUMPY = {
-    1: "i1", 2: "u1",
-    3: "i2", 4: "u2",
-    5: "i4", 6: "u4",
-    7: "f4", 8: "f8",
-}
-
-
-def pointcloud2_to_xyz(msg: PointCloud2) -> np.ndarray:
+def _track_colour(track_id: int) -> tuple:
     """
-    Parse a PointCloud2 into an (N, 3) float64 array of x, y, z (metres).
+    Deterministic, evenly-spread RGB colour for a track ID.
 
-    Builds a numpy structured dtype directly from the message's own field
-    layout (name/offset/datatype) rather than assuming FLOAT32 XYZ packed
-    at offsets 0/4/8 -- works whether or not an intensity field is present,
-    and regardless of field order. Uses np.frombuffer to reinterpret the
-    message bytes directly instead of a per-point Python loop (the offline
-    pipeline's export_fastlio.py can afford that loop since it runs once
-    per recording; this runs every scan, live).
+    Walking the hue wheel by the golden ratio (rather than an 8-entry
+    lookup table indexed with %) means colours don't repeat until floating
+    point precision runs out, not after the 9th track -- long sessions
+    with many track IDs no longer alias two unrelated tracks onto the same
+    colour.
     """
-    names, formats, offsets = [], [], []
-    for field in msg.fields:
-        if field.name not in ("x", "y", "z"):
-            continue
-        names.append(field.name)
-        formats.append(_POINTFIELD_TO_NUMPY[field.datatype])
-        offsets.append(field.offset)
-
-    dtype = np.dtype({
-        "names": names,
-        "formats": formats,
-        "offsets": offsets,
-        "itemsize": msg.point_step,
-    })
-
-    count = msg.width * msg.height
-    structured = np.frombuffer(msg.data, dtype=dtype, count=count)
-    return np.column_stack(
-        [structured["x"], structured["y"], structured["z"]]
-    ).astype(np.float64)
-
-
-def voxel_downsample(points: np.ndarray, voxel_size: float) -> np.ndarray:
-    """
-    Cheap voxel-grid downsample: keep one representative point per occupied
-    voxel cell. Not a centroid average (unlike Open3D's voxel_down_sample)
-    -- picks an arbitrary point per cell, which is fine for the
-    distance-threshold change detection this feeds into, and avoids an
-    Open3D dependency that's awkward to install on the Jetson (see DOCS.md
-    -- point cloud density and dependency weight are already flagged as
-    concerns for the eventual on-Jetson deployment).
-    """
-    if len(points) == 0:
-        return points
-    keys = np.floor(points / voxel_size).astype(np.int64)
-    _, unique_idx = np.unique(keys, axis=0, return_index=True)
-    return points[unique_idx]
-
-
-TRACK_COLOURS = [
-    (1.0, 0.0, 0.0), (0.0, 0.5, 1.0), (1.0, 0.5, 0.0), (0.0, 1.0, 1.0),
-    (1.0, 0.0, 1.0), (1.0, 1.0, 0.0), (0.5, 0.0, 1.0), (0.0, 1.0, 0.5),
-]
+    hue = (track_id * 0.6180339887) % 1.0
+    return colorsys.hsv_to_rgb(hue, 0.85, 1.0)
 
 
 class OnlinePerceptionNode(Node):
@@ -138,6 +136,10 @@ class OnlinePerceptionNode(Node):
         self.declare_parameter("cluster_eps", 0.5)
         self.declare_parameter("cluster_min_points", 10)
         self.declare_parameter("max_match_distance", 1.5)
+        self.declare_parameter("max_missed_frames", 3)
+        self.declare_parameter("kalman_position_std", 0.1)
+        self.declare_parameter("kalman_velocity_std", 2.0)
+        self.declare_parameter("kalman_process_std", 1.0)
         self.declare_parameter("z_max", 2.5)
         self.declare_parameter("frame_id", "camera_init")
 
@@ -146,17 +148,21 @@ class OnlinePerceptionNode(Node):
         self._change_threshold = self.get_parameter("change_threshold").value
         self._cluster_eps = self.get_parameter("cluster_eps").value
         self._cluster_min_points = self.get_parameter("cluster_min_points").value
-        self._max_match_distance = self.get_parameter("max_match_distance").value
         self._z_max = self.get_parameter("z_max").value
         self._frame_id = self.get_parameter("frame_id").value
+
+        self._max_missed_frames = self.get_parameter("max_missed_frames").value
+        self._tracker = CentroidTracker(
+            max_match_distance=self.get_parameter("max_match_distance").value,
+            max_missed_frames=self._max_missed_frames,
+            position_variance=self.get_parameter("kalman_position_std").value ** 2,
+            velocity_variance=self.get_parameter("kalman_velocity_std").value ** 2,
+            process_variance=self.get_parameter("kalman_process_std").value ** 2,
+        )
 
         self._scan_buffer = []
         self._prev_frame = None            # downsampled points, last completed frame
         self._prev_frame_stamp = None
-        self._prev_clusters = []           # clusters from the last frame transition
-        self._prev_cluster_to_track = {}   # cluster index -> track id, last transition
-        self._tracks = {}                  # track id -> (last_centroid, last_stamp)
-        self._next_track_id = 0
         self._frame_count = 0
         self._scan_count = 0
         self._latest_odom = None
@@ -172,7 +178,8 @@ class OnlinePerceptionNode(Node):
             f"online_perception_node ready -- accumulating "
             f"{self._accumulate_scans} scans per frame "
             f"(eps={self._cluster_eps} min_points={self._cluster_min_points} "
-            f"threshold={self._change_threshold} z_max={self._z_max})")
+            f"threshold={self._change_threshold} z_max={self._z_max}, "
+            f"max_missed_frames={self._max_missed_frames})")
 
     def _odom_cb(self, msg: Odometry) -> None:
         self._latest_odom = msg
@@ -214,77 +221,43 @@ class OnlinePerceptionNode(Node):
         distances, _ = tree.query(frame, k=1)
         moved = frame[distances > self._change_threshold]
 
-        clusters = []
-        if len(moved) >= self._cluster_min_points:
-            labels = DBSCAN(
-                eps=self._cluster_eps, min_samples=self._cluster_min_points
-            ).fit_predict(moved)
-            for label in set(labels):
-                if label == -1:
-                    continue
-                cluster_points = moved[labels == label]
-                clusters.append({
-                    "centroid": cluster_points.mean(axis=0),
-                    "n_points": int(len(cluster_points)),
-                })
+        clusters = cluster_moved_points(moved, self._cluster_eps, self._cluster_min_points)
 
         dt = stamp - self._prev_frame_stamp if self._prev_frame_stamp else 0.0
         self.get_logger().info(
             f"frame {self._frame_count}: {len(frame)} pts, "
             f"{len(moved)} moved, {len(clusters)} clusters (dt={dt:.2f}s)")
-        self._update_tracks(clusters, stamp, dt)
+        self._update_tracks(clusters, dt)
 
         self._prev_frame = frame
         self._prev_frame_stamp = stamp
-        self._prev_clusters = clusters
 
-    def _update_tracks(self, clusters, stamp, dt) -> None:
-        curr_cluster_to_track = {}
-
-        if self._prev_clusters and clusters:
-            prev_centroids = np.array([c["centroid"] for c in self._prev_clusters])
-            used_prev = set()
-            for ci, cluster in enumerate(clusters):
-                dists = np.linalg.norm(prev_centroids - cluster["centroid"], axis=1)
-                for pi in np.argsort(dists):
-                    if dists[pi] > self._max_match_distance:
-                        break
-                    if pi in used_prev:
-                        continue
-                    used_prev.add(pi)
-                    if pi in self._prev_cluster_to_track:
-                        curr_cluster_to_track[ci] = self._prev_cluster_to_track[pi]
-                    break
+    def _update_tracks(self, clusters, dt) -> None:
+        active_tracks = self._tracker.step(clusters, dt)
 
         markers = MarkerArray()
-        for ci, cluster in enumerate(clusters):
-            if ci in curr_cluster_to_track:
-                track_id = curr_cluster_to_track[ci]
-                prev_centroid, _ = self._tracks[track_id]
-                displacement = np.linalg.norm(cluster["centroid"] - prev_centroid)
-                speed = displacement / dt if dt > 0 else 0.0
-            else:
-                track_id = self._next_track_id
-                self._next_track_id += 1
-                speed = 0.0
-                curr_cluster_to_track[ci] = track_id
+        for track_id, info in active_tracks.items():
+            track = info["track"]
+            speed = float(np.linalg.norm(track.velocity))
 
-            self._tracks[track_id] = (cluster["centroid"], stamp)
+            status = "new" if info["is_new"] else ("coasting" if info["is_coasting"] else "matched")
             self.get_logger().info(
-                f"  track {track_id}: "
-                f"({cluster['centroid'][0]:.2f}, {cluster['centroid'][1]:.2f}, "
-                f"{cluster['centroid'][2]:.2f}) m, {cluster['n_points']} pts, "
+                f"  track {track_id} [{status}]: "
+                f"({track.position[0]:.2f}, {track.position[1]:.2f}, "
+                f"{track.position[2]:.2f}) m, {track.n_points} pts, "
                 f"{speed:.2f} m/s")
-            markers.markers.extend(self._build_markers(track_id, cluster, speed))
+            markers.markers.extend(self._build_markers(track_id, track, speed, info["is_coasting"]))
 
-        self._prev_cluster_to_track = curr_cluster_to_track
         if markers.markers:
             self._marker_pub.publish(markers)
 
-    def _build_markers(self, track_id, cluster, speed):
-        colour = TRACK_COLOURS[track_id % len(TRACK_COLOURS)]
-        centroid = cluster["centroid"]
+    def _build_markers(self, track_id, track, speed, is_coasting):
+        colour = _track_colour(track_id)
+        centroid = track.position
         now = self.get_clock().now().to_msg()
+        # Coasting tracks are drawn faded out -- a predicted position with
+        # no detection to back it up this frame, not a confirmed sighting.
+        alpha = 0.35 if is_coasting else 0.8
 
         sphere = Marker()
         sphere.header.frame_id = self._frame_id
@@ -299,7 +272,7 @@ class OnlinePerceptionNode(Node):
         sphere.pose.orientation.w = 1.0
         sphere.scale.x = sphere.scale.y = sphere.scale.z = 0.3
         sphere.color.r, sphere.color.g, sphere.color.b = colour
-        sphere.color.a = 0.8
+        sphere.color.a = alpha
         sphere.lifetime.sec = 1
 
         label = Marker()
@@ -315,8 +288,9 @@ class OnlinePerceptionNode(Node):
         label.pose.orientation.w = 1.0
         label.scale.z = 0.25
         label.color.r, label.color.g, label.color.b = colour
-        label.color.a = 1.0
-        label.text = f"track {track_id}: {speed:.2f} m/s"
+        label.color.a = 1.0 if not is_coasting else 0.6
+        suffix = " (coasting)" if is_coasting else ""
+        label.text = f"track {track_id}: {speed:.2f} m/s{suffix}"
         label.lifetime.sec = 1
 
         return [sphere, label]
