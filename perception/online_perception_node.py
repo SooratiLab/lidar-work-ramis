@@ -25,21 +25,25 @@ Kalman noise parameter documents its own units.
 
 Subscribes:
     /cloud_registered   (sensor_msgs/PointCloud2)
-    /Odometry            (nav_msgs/Odometry)  -- currently just logged
-                          alongside each processed frame for reference;
-                          not yet used to compensate motion beyond what
-                          FastLIO already bakes into /cloud_registered.
+    /Odometry            (nav_msgs/Odometry)  -- the robot's current
+                          position gates implausible detections (see
+                          max_sensor_range below); not used to
+                          motion-compensate beyond what FastLIO already
+                          bakes into /cloud_registered.
 
 Publishes:
     /online_perception/markers   (visualization_msgs/MarkerArray) -- one
-                                   sphere + one text label per active track,
-                                   viewable in RViz2 against the same
-                                   "camera_init" frame FastLIO publishes in.
-                                   Coasting tracks (predicted position, no
-                                   detection this frame) are drawn at
-                                   reduced opacity so it's visually obvious
-                                   when a track is being carried through a
-                                   gap rather than freshly confirmed.
+                                   sphere + one text label per confirmed
+                                   track, viewable in RViz2 against the
+                                   same "camera_init" frame FastLIO
+                                   publishes in. Coasting tracks (predicted
+                                   position, no detection this frame) are
+                                   drawn at reduced opacity so it's visually
+                                   obvious when a track is being carried
+                                   through a gap rather than freshly
+                                   confirmed. Tentative tracks (fewer than
+                                   min_hits real detections so far) are not
+                                   published at all -- see min_hits below.
 
 Parameters (all overridable via --ros-args -p <name>:=<value>):
     accumulate_scans     (int,   default 10)    scans merged per frame --
@@ -59,6 +63,53 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  coasting (predicted
                                                  position, no detection)
                                                  before it's dropped
+    max_missed_seconds   (float, default 3.0)   real seconds a track keeps
+                                                 coasting before it's
+                                                 dropped, whichever of this
+                                                 and max_missed_frames comes
+                                                 first -- catches the case a
+                                                 frame count alone can't:
+                                                 testing against a session
+                                                 with a degraded, bursty
+                                                 scan rate found a track
+                                                 that survived a 42-second
+                                                 real gap because only 3
+                                                 *frames* happened to occur
+                                                 in that stretch, coasting
+                                                 its prediction to a
+                                                 position 15+ metres from
+                                                 anywhere real
+    min_hits              (int,   default 2)     real detections a track
+                                                 needs before it's
+                                                 "confirmed" and reported --
+                                                 filters single-frame noise
+                                                 clusters, which testing
+                                                 against recorded sessions
+                                                 showed never get a second
+                                                 real detection (see
+                                                 tracking.py's
+                                                 CentroidTracker docstring)
+    max_sensor_range      (float, default 40.0)  detections farther than
+                                                 this from the robot's
+                                                 current /Odometry position
+                                                 are dropped as implausible
+                                                 -- guards against reporting
+                                                 phantom "tracks" if
+                                                 FastLIO's registration ever
+                                                 drifts (seen on degraded
+                                                 pre-DDS-fix recordings
+                                                 during testing, where scan-
+                                                 matching failures put
+                                                 /cloud_registered points
+                                                 hundreds of metres from
+                                                 anywhere real). A Mid-360's
+                                                 rated range for typical
+                                                 (~10% reflectivity) targets
+                                                 is well under this; a
+                                                 "detection" beyond it is
+                                                 far more likely to be
+                                                 drifted odometry than a
+                                                 real long-range return.
     kalman_position_std   (float, default 0.1)   assumed centroid
                                                  measurement noise (m) --
                                                  how much a single DBSCAN
@@ -83,13 +134,14 @@ mm -> m), since that's the best available starting point for FastLIO's
 sparse, moving-sensor point density -- not re-derived from scratch here.
 They are a starting point, not a guarantee; re-tune against whatever this
 node's actual frame density turns out to be once running against a live
-sensor. The Kalman noise parameters are new and have no offline equivalent
-to carry over -- their defaults are reasoned from walking-pace human motion
-(see the module docstring above each one) and, like the detection
-parameters, should be revisited once more sessions have been run.
+sensor. The Kalman noise, min_hits, and max_sensor_range parameters are new
+and have no offline equivalent to carry over -- their defaults are reasoned
+(see each one's docstring above) and validated against recorded sessions
+during testing, not tuned against a live sensor yet.
 """
 import colorsys
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -109,7 +161,7 @@ from visualization_msgs.msg import Marker, MarkerArray
 # already uses for its own local imports.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pointcloud import pointcloud2_to_xyz, voxel_downsample
-from tracking import CentroidTracker, cluster_moved_points
+from tracking import CentroidTracker, cluster_moved_points, filter_plausible_detections
 
 
 def _track_colour(track_id: int) -> tuple:
@@ -137,6 +189,9 @@ class OnlinePerceptionNode(Node):
         self.declare_parameter("cluster_min_points", 10)
         self.declare_parameter("max_match_distance", 1.5)
         self.declare_parameter("max_missed_frames", 3)
+        self.declare_parameter("max_missed_seconds", 3.0)
+        self.declare_parameter("min_hits", 2)
+        self.declare_parameter("max_sensor_range", 40.0)
         self.declare_parameter("kalman_position_std", 0.1)
         self.declare_parameter("kalman_velocity_std", 2.0)
         self.declare_parameter("kalman_process_std", 1.0)
@@ -148,13 +203,17 @@ class OnlinePerceptionNode(Node):
         self._change_threshold = self.get_parameter("change_threshold").value
         self._cluster_eps = self.get_parameter("cluster_eps").value
         self._cluster_min_points = self.get_parameter("cluster_min_points").value
+        self._max_sensor_range = self.get_parameter("max_sensor_range").value
         self._z_max = self.get_parameter("z_max").value
         self._frame_id = self.get_parameter("frame_id").value
 
         self._max_missed_frames = self.get_parameter("max_missed_frames").value
+        self._max_missed_seconds = self.get_parameter("max_missed_seconds").value
         self._tracker = CentroidTracker(
             max_match_distance=self.get_parameter("max_match_distance").value,
             max_missed_frames=self._max_missed_frames,
+            max_missed_seconds=self._max_missed_seconds,
+            min_hits=self.get_parameter("min_hits").value,
             position_variance=self.get_parameter("kalman_position_std").value ** 2,
             velocity_variance=self.get_parameter("kalman_velocity_std").value ** 2,
             process_variance=self.get_parameter("kalman_process_std").value ** 2,
@@ -166,6 +225,8 @@ class OnlinePerceptionNode(Node):
         self._frame_count = 0
         self._scan_count = 0
         self._latest_odom = None
+        self._logged_missing_odom_warning = False
+        self._timing_samples = []  # last 50 _process_frame wall-clock durations (s)
 
         self._cloud_sub = self.create_subscription(
             PointCloud2, "/cloud_registered", self._cloud_cb, 10)
@@ -179,7 +240,9 @@ class OnlinePerceptionNode(Node):
             f"{self._accumulate_scans} scans per frame "
             f"(eps={self._cluster_eps} min_points={self._cluster_min_points} "
             f"threshold={self._change_threshold} z_max={self._z_max}, "
-            f"max_missed_frames={self._max_missed_frames})")
+            f"max_missed_frames={self._max_missed_frames}, "
+            f"max_missed_seconds={self._max_missed_seconds}, "
+            f"max_sensor_range={self._max_sensor_range})")
 
     def _odom_cb(self, msg: Odometry) -> None:
         self._latest_odom = msg
@@ -200,6 +263,17 @@ class OnlinePerceptionNode(Node):
         self._process_frame(frame, stamp)
 
     def _process_frame(self, frame: np.ndarray, stamp: float) -> None:
+        # Wall-clock processing time for this frame, measured against the
+        # real-world time it represents (dt below) -- the real-time budget
+        # question that matters for the eventual Jetson port isn't "is this
+        # fast" in the abstract, it's "does processing a frame take less
+        # wall-clock time than the frame itself spans." A laptop's numbers
+        # here are optimistic for a Jetson's weaker CPU, but a pipeline
+        # that's already using most of its budget on x86 is a clear warning
+        # sign; one comfortably inside budget is a necessary (not
+        # sufficient) condition for the port to have a chance.
+        processing_start = time.perf_counter()
+
         frame = voxel_downsample(frame, self._voxel_size)
         if self._z_max is not None:
             frame = frame[frame[:, 2] <= self._z_max]
@@ -222,21 +296,91 @@ class OnlinePerceptionNode(Node):
         moved = frame[distances > self._change_threshold]
 
         clusters = cluster_moved_points(moved, self._cluster_eps, self._cluster_min_points)
+        clusters, n_implausible = self._drop_implausible_clusters(clusters)
 
         dt = stamp - self._prev_frame_stamp if self._prev_frame_stamp else 0.0
+        self._update_tracks(clusters, dt)
+
+        processing_s = time.perf_counter() - processing_start
+        self._log_frame_timing(processing_s, dt)
         self.get_logger().info(
             f"frame {self._frame_count}: {len(frame)} pts, "
-            f"{len(moved)} moved, {len(clusters)} clusters (dt={dt:.2f}s)")
-        self._update_tracks(clusters, dt)
+            f"{len(moved)} moved, {len(clusters)} clusters "
+            f"({n_implausible} dropped as implausible) (dt={dt:.2f}s, "
+            f"processed in {processing_s * 1000:.1f}ms)")
 
         self._prev_frame = frame
         self._prev_frame_stamp = stamp
+
+    def _drop_implausible_clusters(self, clusters):
+        """
+        Apply the odometry-based plausibility gate (see max_sensor_range in
+        the module docstring). Returns (surviving_clusters, n_dropped).
+
+        Fails open (no filtering) until the first /Odometry message
+        arrives -- FastLIO publishes odometry and cloud_registered
+        together per scan, so in practice this only matters for the very
+        first frame or two, and refusing to detect anything just because
+        odometry hasn't arrived yet would be a worse failure mode than
+        occasionally letting an implausible detection through before the
+        gate is live.
+        """
+        if not clusters or self._latest_odom is None:
+            if self._latest_odom is None and not self._logged_missing_odom_warning:
+                self.get_logger().warning(
+                    "no /Odometry received yet -- plausibility filtering "
+                    "disabled until it arrives")
+                self._logged_missing_odom_warning = True
+            return clusters, 0
+
+        sensor_position = np.array([
+            self._latest_odom.pose.pose.position.x,
+            self._latest_odom.pose.pose.position.y,
+            self._latest_odom.pose.pose.position.z,
+        ])
+        filtered = filter_plausible_detections(clusters, sensor_position, self._max_sensor_range)
+        return filtered, len(clusters) - len(filtered)
+
+    def _log_frame_timing(self, processing_s: float, dt: float) -> None:
+        """
+        Warn once processing a frame starts eating into the real-time
+        budget dt represents -- the earliest, cheapest signal that either
+        the accumulate/voxel/cluster parameters need to shrink or the
+        underlying hardware needs to be faster, well before this actually
+        falls behind on a live sensor and starts silently dropping scans.
+        """
+        self._timing_samples.append(processing_s)
+        if len(self._timing_samples) > 50:
+            self._timing_samples.pop(0)
+
+        if dt > 0 and processing_s > 0.5 * dt:
+            self.get_logger().warning(
+                f"frame {self._frame_count} took {processing_s * 1000:.1f}ms "
+                f"to process a {dt:.2f}s frame ({processing_s / dt * 100:.0f}% "
+                f"of budget) -- getting close to falling behind real time")
+
+        if self._frame_count % 20 == 0:
+            samples = np.array(self._timing_samples)
+            self.get_logger().info(
+                f"processing time over last {len(samples)} frames: "
+                f"mean {samples.mean() * 1000:.1f}ms, "
+                f"max {samples.max() * 1000:.1f}ms")
 
     def _update_tracks(self, clusters, dt) -> None:
         active_tracks = self._tracker.step(clusters, dt)
 
         markers = MarkerArray()
         for track_id, info in active_tracks.items():
+            # Tentative tracks (fewer than min_hits real detections) are
+            # tracked internally so they have a chance to become confirmed,
+            # but not logged or published -- testing showed most of these
+            # are single-frame noise that never gets a second detection at
+            # all, and reporting them identically to a real track made the
+            # output far noisier than the underlying detection rate
+            # justified. See tracking.py's CentroidTracker docstring.
+            if not info["is_confirmed"]:
+                continue
+
             track = info["track"]
             speed = float(np.linalg.norm(track.velocity))
 

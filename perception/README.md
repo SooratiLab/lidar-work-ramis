@@ -65,9 +65,145 @@ concrete failure modes:
   single measurement and a two-point difference. This is also what gives a
   track a principled predicted position to coast on.
 - **Coasting**: a track that goes unmatched keeps predicting forward for up
-  to `max_missed_frames` frames (drawn faded out in RViz, see
+  to `max_missed_frames` frames, or `max_missed_seconds` of real elapsed
+  time, whichever comes first (drawn faded out in RViz, see
   `online_perception_node.py`'s marker code) before being dropped, instead
-  of ending on the first missed frame.
+  of ending on the first missed frame. Both limits matter: a frame *count*
+  alone isn't reliable when the scan rate is degraded or bursty (see
+  "Testing against more sessions" below) -- a handful of frames can span
+  tens of real seconds, long enough that a constant-velocity coast runs off
+  to somewhere implausible.
+- **Track confirmation** (`min_hits`): a track isn't logged or published
+  until it has `min_hits` real detections, not just its first one. Testing
+  against several recorded sessions found that single-frame noise clusters
+  -- long-range LiDAR noise, or on a moving sensor, a static object newly
+  entering the field of view and looking like motion -- are common, and
+  every single one of them got exactly one real detection and was never
+  seen again. Requiring a second real detection before reporting a track
+  filters this whole category out, at the cost of one extra frame of
+  latency (with the default `min_hits=2`) before a genuinely new object is
+  reported.
+- **Odometry-based plausibility gate** (`filter_plausible_detections`,
+  gated by `max_sensor_range`): detections farther than `max_sensor_range`
+  from the robot's current `/Odometry` position are dropped before they
+  ever reach the tracker. This is the one place `/Odometry` is actually
+  used for something beyond logging -- see "Testing against more sessions"
+  below for the failure mode it guards against.
+
+## Testing against more recorded sessions
+
+Beyond the `soton_indoor` session used to validate the initial rewrite (see
+"What's verified" below), the tracker was run against several other
+recorded sessions to build confidence before attempting a Jetson port.
+Full methodology: `docker compose --profile replay up` against each bag in
+turn, log kept, track lifetimes reconstructed from the log (birth/death
+time, position, real-detection count) and compared across runs.
+
+**Processing time has a large margin.** Across every session tested, mean
+processing time per frame was 8-40ms and the worst single frame was
+70ms -- against a 1-second-per-frame budget (`accumulate_scans=10` at
+FastLIO's ~10 Hz), that's under 10% even in the worst case seen, measured
+on a laptop x86_64 CPU. This is optimistic for a Jetson's weaker
+single-core performance and isn't proof the Jetson port will have the same
+margin, but a pipeline already close to its budget on a laptop would have
+been a hard "no" -- this instead leaves real headroom to work with. The
+node logs a warning if any frame's processing time exceeds 50% of the
+frame's real time span, as an early signal if this changes on different
+hardware.
+
+**Coasting works as designed for brief real gaps.** Rerunning the
+`fallback_cardbox1` session (a person walking with intermittent occlusion
+behind cardboard boxes) shows tracks correctly coasting through single
+missed detections and re-matching, the same behaviour confirmed on
+`soton_indoor`. It does *not*, by design, bridge a multi-second occlusion
+or a deliberate stop -- a person hidden or stationary for longer than
+`max_missed_frames`/`max_missed_seconds` gets a new track ID when they
+reappear. Extending those limits to cover longer gaps isn't free (a longer
+constant-velocity extrapolation is also a less trustworthy one -- see the
+`max_missed_seconds` fix below); a proper fix would be re-identifying a new
+detection against a recently-dropped track's last known position rather
+than just coasting longer, which hasn't been built yet (see `../TODO.md`).
+
+**A moving sensor produces substantially more false positives than a
+stationary one -- confirmed and quantified, not just anecdotal.** Comparing
+sessions:
+
+| session | sensor | duration | distinct tracks logged (before confirmation filter) |
+|---|---|---|---|
+| `soton_indoor` | stationary | ~24s | 7 |
+| `fallback_cardbox1` | stationary | ~86s | 38 |
+| `lab_walk_no_stop` | walking, continuous | ~38s | 22 |
+| `lab_walk_with_stops` | walking, stop-and-go | ~75s | 361 |
+
+`lab_walk_with_stops` stood out sharply: mean "moved" points per frame was
+843 (max 1548) versus `lab_walk_no_stop`'s mean of 263 (max 386) -- roughly
+3x higher despite both being a walking dog. The most likely explanation is
+the abrupt stop-start motion itself: each transition is a jolt that FastLIO's
+registration has to re-settle after, and any brief registration jitter
+shows up as widespread spurious "moved" points across the whole scene, not
+just at the person's location -- this is a plausible mechanism, not
+independently confirmed against FastLIO's internal state, since no ground
+truth pose is available for this session. Either way, this is on top of the
+already-documented issue (Kei's handover, `../DOCS.md`) that a moving
+sensor's own field of view changing between frames makes newly-visible
+static geometry indistinguishable from a moving object, since the change
+detector only asks "was there a point near here in the previous frame,"
+not "could this location have been outside both frames' shared field of
+view." **Track confirmation (`min_hits`) filters the single-frame-noise
+half of this problem well** (`lab_walk_with_stops` still dropped from 361
+to 207 distinct tracks after the fix), but a large residual remains: 140
+of those tracks, spot-checked, were spatially and temporally consistent
+enough to survive 2-3 real detections without being a real object --
+tracking-side fixes (better assignment, filtering, coasting) can't fully
+solve a problem that originates in the detection step. See "Open risk for
+the Jetson port" below.
+
+**Degraded/pre-DDS-fix recordings expose two real gaps, now fixed.**
+Replaying `dog1/2026-05-13_14_41_dds_test` (recorded before the DDS
+multicast whitelist and LiDAR timestamp fixes landed) showed FastLIO's own
+registration failing intermittently on this data (`No point, skip this
+scan!` and `lidar loop back, clear buffer` in its log) and, once, drifting
+badly enough to put `/cloud_registered` points over a kilometre from
+anywhere real. Before the fixes below, the tracker treated this exactly
+like a real detection -- clustering and tracking phantom "objects" at
+those positions with no indication anything was wrong. Two fixes address
+this directly:
+
+- `max_sensor_range` drops any detection implausibly far from the robot's
+  current `/Odometry` position before it reaches the tracker.
+- `max_missed_seconds` caps how long a track can coast in real time, not
+  just in frame count -- the same session showed a track survive a
+  42-second real gap because only 3 accumulated *frames* happened to occur
+  in that stretch (the scan rate itself was degraded and bursty), long
+  enough for its coasted Kalman prediction to run 15+ metres from its last
+  real position. Re-running the same session after the fix confirms the
+  track gets dropped instead.
+
+This doesn't mean pre-DDS-fix recordings are good test data for tuning
+detection accuracy -- they're testing exactly the pathological conditions
+the DDS/timestamp fixes exist to prevent, and the node correctly does very
+little useful work on them. What it does confirm is that a live sensor's
+own instability (a bad scan, a registration hiccup, a temporary DDS issue)
+won't silently produce confident-looking phantom detections -- it fails
+safe instead of failing invisibly.
+
+## Open risk for the Jetson port
+
+The single biggest remaining accuracy risk, based on the testing above, is
+the moving-sensor false-positive rate -- specifically that it is a
+*detection-side* problem (frame-to-frame nearest-neighbour change
+detection can't distinguish "newly visible because the sensor's field of
+view changed" from "genuinely moved"), not something addressable by
+further tracking-side refinement. `min_hits` narrows it considerably but
+doesn't solve it. A field deployment almost certainly involves a walking,
+not stationary, dog, so this is worth resolving -- or at least
+consciously deciding to accept -- before relying on this pipeline's output
+in the field. The most promising direction identified but not yet
+prototyped: use `/Odometry` to restrict change detection to the region of
+the current frame that was also within the previous frame's field of view,
+so newly-visible geometry at the edges stops being compared against
+"nothing was there before" by construction. This is a detection-algorithm
+change, not a tracking one, and hasn't been scoped in detail yet.
 
 ## Testing
 
@@ -76,12 +212,12 @@ pip install numpy scipy scikit-learn pytest   # or: apt install python3-numpy py
 python3 -m pytest tests/
 ```
 
-These cover the pure clustering/assignment/Kalman-filter logic in
-`tracking.py` and the PointCloud2 parsing/downsampling in `pointcloud.py` --
-no ROS install, no bag file, no running node needed, so they're the fast
-repeatable check to run after touching either module. They do not exercise
-`online_perception_node.py` itself (the ROS wiring) -- that still needs the
-bag-replay check below.
+These cover the pure clustering/assignment/Kalman-filter/plausibility-gate
+logic in `tracking.py` and the PointCloud2 parsing/downsampling in
+`pointcloud.py` -- no ROS install, no bag file, no running node needed, so
+they're the fast repeatable check to run after touching either module. They
+do not exercise `online_perception_node.py` itself (the ROS wiring) -- that
+still needs the bag-replay check below.
 
 ## Running it
 
@@ -161,24 +297,28 @@ run):
 
 **Not yet done:**
 
-- No live sensor tested -- only a replayed bag standing in for one. The
-  node itself doesn't know or care which it's talking to, but "the same
-  code should work" and "confirmed working against a live sensor" are
-  different claims -- don't conflate them in future notes.
-- Only this one session re-tested after the tracking rewrite. The fallback
-  cardboard-box and two-dog sessions (better tests of occlusion/coasting,
-  since they involve objects actually blocking the sensor's view rather
-  than just a detector miss) haven't been run against the new tracker yet.
-- No re-tuning yet. The detection-side parameter defaults are carried over
-  from `track_motion.py`'s offline FastLIO-tuned values (see the module
-  docstring) -- they happened to reproduce Kei's result on this session,
-  which is a good sign, not proof they're right for other sessions or for
-  a live sensor's actual timing/density. The Kalman noise parameters are
-  new and have had no tuning pass at all yet, just reasoned defaults.
-- `/Odometry` is subscribed but not yet used for anything -- see the module
-  docstring. Whether it's needed at all depends on how much of FastLIO's
-  own registration already covers what it would be used for.
+- No live sensor tested -- only replayed bags standing in for one. The node
+  itself doesn't know or care which it's talking to, but "the same code
+  should work" and "confirmed working against a live sensor" are different
+  claims -- don't conflate them in future notes.
+- The moving-sensor false-positive rate (see "Open risk for the Jetson
+  port" above) is the most important open accuracy question, and it's a
+  detection-side problem this round of testing identified and quantified
+  but didn't fix.
+- No parameter re-tuning against a live sensor yet. The detection-side
+  parameter defaults are carried over from `track_motion.py`'s offline
+  FastLIO-tuned values; the Kalman noise, `min_hits`, `max_missed_seconds`,
+  and `max_sensor_range` parameters are new and were validated against
+  recorded sessions during this round of testing (see above) but not
+  against live sensor timing/density.
+- `/Odometry` is now used for the plausibility gate, but not yet for
+  motion-compensating detections or restricting change detection to the
+  overlapping field of view between frames -- the latter is the leading
+  candidate fix for the moving-sensor false-positive problem above.
 - Accumulate-then-cluster (fixed-size non-overlapping frames, mirroring
   `--accumulate 10` in the offline pipeline) is the simplest possible port
   of the existing algorithm, not necessarily the right online architecture
   -- see `../TODO.md`'s Phase 2 notes on this.
+- Multi-object re-identification after a real, multi-second occlusion or
+  stop (as opposed to a single missed frame) isn't implemented -- see
+  "Testing against more recorded sessions" above.

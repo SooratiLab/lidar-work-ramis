@@ -14,6 +14,7 @@ from tracking import (
     KalmanTrack,
     assign_detections,
     cluster_moved_points,
+    filter_plausible_detections,
 )
 
 
@@ -44,6 +45,32 @@ def test_cluster_moved_points_below_min_points_short_circuits():
     # Fewer total points than min_points -- must not even call DBSCAN.
     points = np.zeros((3, 3))
     assert cluster_moved_points(points, eps=0.5, min_points=10) == []
+
+
+# --- filter_plausible_detections -------------------------------------------
+
+def test_filter_plausible_detections_drops_far_outliers():
+    clusters = [
+        {"centroid": np.array([5.0, 0.0, 0.0])},   # 5 m from sensor -- plausible
+        {"centroid": np.array([1000.0, 0.0, 0.0])},  # drifted-odometry-scale outlier
+    ]
+    sensor_position = np.array([0.0, 0.0, 0.0])
+
+    result = filter_plausible_detections(clusters, sensor_position, max_range=40.0)
+
+    assert len(result) == 1
+    np.testing.assert_allclose(result[0]["centroid"], [5.0, 0.0, 0.0])
+
+
+def test_filter_plausible_detections_uses_sensor_position_not_origin():
+    # A cluster 5 m from the sensor's *current* position should survive
+    # even though it's far from the world origin -- the sensor has moved.
+    clusters = [{"centroid": np.array([105.0, 0.0, 0.0])}]
+    sensor_position = np.array([100.0, 0.0, 0.0])
+
+    result = filter_plausible_detections(clusters, sensor_position, max_range=40.0)
+
+    assert len(result) == 1
 
 
 # --- assign_detections ----------------------------------------------------
@@ -173,6 +200,24 @@ def test_centroid_tracker_drops_track_after_max_missed_frames():
     assert track_id not in tracker.tracks
 
 
+def test_centroid_tracker_drops_track_after_max_missed_seconds_even_with_few_frames():
+    # A degraded/bursty scan rate can mean very few *frames* occur across a
+    # long real gap. max_missed_frames alone wouldn't catch this -- the
+    # wall-clock cap must drop the track before its coasted prediction runs
+    # off to somewhere implausible.
+    tracker = CentroidTracker(max_match_distance=1.5, max_missed_frames=10,
+                               max_missed_seconds=5.0)
+
+    result = tracker.step([{"centroid": np.array([0.0, 0.0, 0.0])}], dt=1.0)
+    (track_id, _), = result.items()
+
+    tracker.step([], dt=1.0)  # missed=1, missed_seconds=1 -- still coasting
+    result = tracker.step([], dt=10.0)  # missed=2, missed_seconds=11 -- over the cap
+
+    assert track_id not in result
+    assert track_id not in tracker.tracks
+
+
 def test_centroid_tracker_assigns_new_ids_to_two_people():
     tracker = CentroidTracker(max_match_distance=1.0)
 
@@ -190,3 +235,42 @@ def test_centroid_tracker_assigns_new_ids_to_two_people():
     ], dt=1.0)
     assert len(result) == 2
     assert all(not info["is_new"] for info in result.values())
+
+
+# --- track confirmation (min_hits) -----------------------------------------
+
+def test_single_frame_noise_never_becomes_confirmed():
+    # A cluster that appears once and is never seen again (the dominant
+    # false-positive pattern found when testing against recorded sessions --
+    # long-range LiDAR noise, or a static object newly entering the field of
+    # view on a moving sensor) should never cross is_confirmed=True at any
+    # point in its short life.
+    tracker = CentroidTracker(max_match_distance=1.5, max_missed_frames=3, min_hits=2)
+
+    result = tracker.step([{"centroid": np.array([10.0, 10.0, 0.0])}], dt=1.0)
+    (track_id, info), = result.items()
+    assert info["is_confirmed"] is False
+
+    for _ in range(3):
+        result = tracker.step([], dt=1.0)
+        assert result[track_id]["is_confirmed"] is False
+
+    # And it's gone for good after coasting out.
+    result = tracker.step([], dt=1.0)
+    assert track_id not in result
+
+
+def test_track_becomes_confirmed_after_min_hits_real_detections():
+    tracker = CentroidTracker(max_match_distance=1.5, min_hits=2)
+
+    result = tracker.step([{"centroid": np.array([0.0, 0.0, 0.0])}], dt=1.0)
+    (track_id, info) = next(iter(result.items()))
+    assert info["is_confirmed"] is False  # only 1 hit so far
+
+    result = tracker.step([{"centroid": np.array([0.5, 0.0, 0.0])}], dt=1.0)
+    assert result[track_id]["is_confirmed"] is True  # 2nd real hit
+
+    # Stays confirmed while coasting through a later missed frame too.
+    result = tracker.step([], dt=1.0)
+    assert result[track_id]["is_confirmed"] is True
+    assert result[track_id]["is_coasting"] is True

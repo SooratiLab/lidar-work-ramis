@@ -63,6 +63,32 @@ def cluster_moved_points(points: np.ndarray, eps: float, min_points: int) -> lis
     return clusters
 
 
+def filter_plausible_detections(clusters: list, sensor_position: np.ndarray,
+                                 max_range: float) -> list:
+    """
+    Drop clusters implausibly far from the sensor's current position.
+
+    Motivated by degraded/pre-fix recordings where FastLIO's registration
+    diverged (scan-matching failing on a fast or jerky motion, or on
+    already-corrupted LiDAR/IMU timestamps): /cloud_registered can end up
+    containing points thousands of metres from anything real, which
+    cluster and track exactly like a genuine detection with nothing in the
+    pipeline to say otherwise. A Livox Mid-360 has a rated detection range
+    on the order of tens of metres for typical (~10% reflectivity)
+    targets like clothing -- max_range should be set a little above that,
+    not at the sensor's absolute maximum spec range, since a "person"
+    detection far beyond typical range is far more likely to be drifted
+    odometry than a real long-range return.
+
+    sensor_position: (3,) array, the sensor's current position in the same
+    frame as the cluster centroids (i.e. FastLIO's /Odometry position,
+    not the world origin -- distance from the origin isn't meaningful once
+    the sensor has moved away from where it started).
+    """
+    return [c for c in clusters
+            if np.linalg.norm(c["centroid"] - sensor_position) <= max_range]
+
+
 def assign_detections(track_positions: np.ndarray, detection_positions: np.ndarray,
                        max_distance: float):
     """
@@ -140,8 +166,9 @@ class KalmanTrack:
 
         self.n_points = 0
         self.size = np.zeros(3)
-        self.hits = 1     # frames this track has ever received a real detection
-        self.missed = 0   # consecutive frames since the last real detection
+        self.hits = 1            # frames this track has ever received a real detection
+        self.missed = 0          # consecutive frames since the last real detection
+        self.missed_seconds = 0.0  # real time elapsed since the last real detection
 
     @property
     def position(self) -> np.ndarray:
@@ -187,6 +214,7 @@ class KalmanTrack:
         self.P = (np.eye(6) - K @ H) @ self.P
 
         self.missed = 0
+        self.missed_seconds = 0.0
         self.hits += 1
 
 
@@ -199,14 +227,40 @@ class CentroidTracker:
     globally-optimal matching gated by max_match_distance, updates matched
     tracks with their new measurement, starts new tracks for unmatched
     detections, and coasts unmatched tracks (keeps predicting, no
-    measurement update) for up to max_missed_frames before dropping them.
+    measurement update) for up to max_missed_frames before dropping them --
+    or up to max_missed_seconds of real elapsed time, whichever comes
+    first. The frame-count limit alone isn't reliable on irregular data:
+    testing against a session with a degraded, bursty scan rate (pre-DDS-
+    fix recording conditions) found a track that survived a 42-second real
+    gap because only 3 *frames* happened to occur in that stretch, then
+    coasted its Kalman prediction across the whole gap and reported a
+    position 15+ metres from anything real. A constant-velocity
+    extrapolation is only trustworthy over the second or two coasting is
+    meant to bridge, not over tens of seconds -- max_missed_seconds catches
+    that case even when max_missed_frames hasn't been reached yet.
+
+    Every track also carries an is_confirmed flag (hits >= min_hits).
+    Testing against several recorded sessions showed that a large fraction
+    of all tracks ever created are pure single-frame noise -- a DBSCAN
+    cluster that clears eps/min_points by chance on one frame (typically
+    from long-range LiDAR noise or, on a moving sensor, a static object
+    newly entering the field of view looking like motion) and is never
+    seen again. Every one of these got exactly one real detection, then
+    coasted for max_missed_frames frames and disappeared -- never a second
+    real detection. Requiring min_hits real detections before a track
+    counts as "confirmed" filters this whole category out of what gets
+    logged/published, at the cost of one extra frame of latency (with the
+    default min_hits=2) before a genuinely new object gets reported.
     """
 
     def __init__(self, max_match_distance: float, max_missed_frames: int = 3,
+                 max_missed_seconds: float = 3.0, min_hits: int = 2,
                  position_variance: float = 0.01, velocity_variance: float = 4.0,
                  process_variance: float = 1.0):
         self._max_match_distance = max_match_distance
         self._max_missed_frames = max_missed_frames
+        self._max_missed_seconds = max_missed_seconds
+        self._min_hits = min_hits
         self._position_variance = position_variance
         self._velocity_variance = velocity_variance
         self._process_variance = process_variance
@@ -225,8 +279,13 @@ class CentroidTracker:
             model's predict step.
 
         Returns {track_id: {'track': KalmanTrack, 'is_new': bool,
-        'is_coasting': bool}} for every track active this frame -- matched,
-        newly created, or still within its coasting window.
+        'is_coasting': bool, 'is_confirmed': bool}} for every track active
+        this frame -- matched, newly created, or still within its coasting
+        window. is_new/is_coasting describe what happened to the track
+        *this frame*; is_confirmed describes the track's status overall
+        (hits >= min_hits) and is what callers should gate
+        logging/publishing on to avoid reporting single-frame noise as if
+        it were a real detection.
         """
         for track in self.tracks.values():
             track.predict(dt)
@@ -249,16 +308,20 @@ class CentroidTracker:
             track.update(detection["centroid"])
             track.n_points = detection.get("n_points", track.n_points)
             track.size = detection.get("size", track.size)
-            active[tid] = {"track": track, "is_new": False, "is_coasting": False}
+            active[tid] = {"track": track, "is_new": False, "is_coasting": False,
+                            "is_confirmed": track.hits >= self._min_hits}
 
         for t_idx in unmatched_tracks:
             tid = track_ids[t_idx]
             track = self.tracks[tid]
             track.missed += 1
-            if track.missed > self._max_missed_frames:
+            track.missed_seconds += dt
+            if (track.missed > self._max_missed_frames
+                    or track.missed_seconds > self._max_missed_seconds):
                 del self.tracks[tid]
                 continue
-            active[tid] = {"track": track, "is_new": False, "is_coasting": True}
+            active[tid] = {"track": track, "is_new": False, "is_coasting": True,
+                            "is_confirmed": track.hits >= self._min_hits}
 
         for d_idx in unmatched_detections:
             detection = detections[d_idx]
@@ -269,6 +332,7 @@ class CentroidTracker:
             track.n_points = detection.get("n_points", 0)
             track.size = detection.get("size", np.zeros(3))
             self.tracks[tid] = track
-            active[tid] = {"track": track, "is_new": True, "is_coasting": False}
+            active[tid] = {"track": track, "is_new": True, "is_coasting": False,
+                            "is_confirmed": track.hits >= self._min_hits}
 
         return active
