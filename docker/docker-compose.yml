@@ -9,8 +9,15 @@ services:
     # this image without a real 192.168.1.x interface present). Host
     # networking is required, not just convenient.
     network_mode: host
+    # Deliberately NOT using ${VAR:?message} here -- Compose interpolates
+    # every service's environment/volumes block for the whole file up
+    # front, before profile filtering decides which services actually run.
+    # A required-var error on an unrelated service would break plain
+    # `docker compose build` even with no .env present. LIVOX_LIDAR_IP is
+    # still enforced -- just at the right time, by entrypoint.sh inside the
+    # container, when the driver command actually runs.
     environment:
-      - LIVOX_LIDAR_IP=${LIVOX_LIDAR_IP:?set LIVOX_LIDAR_IP in .env -- copy .env.example first}
+      - LIVOX_LIDAR_IP=${LIVOX_LIDAR_IP:-}
       - LIVOX_HOST_IP=${LIVOX_HOST_IP:-192.168.1.50}
     command: ["driver"]
     restart: unless-stopped
@@ -27,15 +34,19 @@ services:
   # Replay profile -- stands in for the live driver when no LiDAR/Jetson is
   # reachable. Plays a recorded rosbag at (roughly) real-time rate against a
   # live FastLIO instance, so the rest of the pipeline sees the same message
-  # stream/timing it would from a real sensor. Needs BAG_PATH set to a
-  # directory containing metadata.yaml + a .db3 file (e.g. one of Kei's
-  # recordings under kei-stuff/ros2-go2/bag/).
+  # stream/timing it would from a real sensor. Needs BAG_PATH set (in .env)
+  # to a directory containing metadata.yaml + a .db3 file (e.g. one of
+  # Kei's recordings under kei-stuff/ros2-go2/bag/). Falls back to mounting
+  # this directory if BAG_PATH is unset, which fails clearly at
+  # `docker compose up bag` time ("no bag found") rather than at parse time
+  # -- see the driver service's comment above for why there's no
+  # required-var check at the Compose level.
   bag:
     image: go2-lidar-humble:latest
     container_name: go2-bag-replay
     network_mode: host
     volumes:
-      - ${BAG_PATH:?set BAG_PATH in .env to a rosbag2 directory}:/bag:ro
+      - ${BAG_PATH:-.}:/bag:ro
     # Small delay so FastLIO's subscriber is up before the first message --
     # matches the manual "wait for Node init finished" step in
     # go2-jetson-setup.md; without it the bag's first IMU/LiDAR messages can
