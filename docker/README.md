@@ -18,17 +18,31 @@ this), see the repo's internal notes for what's still open.
 Dockerfile                        image build: Livox-SDK2 + colcon workspace
 entrypoint.sh                     renders per-dog LiDAR config, dispatches launch
 patch_livox_timestamp.py          LiDAR/IMU timestamp fix, applied at build time
-docker-compose.yml                driver + FastLIO services, host networking
-.env.example                      copy to .env, set LIVOX_LIDAR_IP per dog
+docker-compose.yml                driver + FastLIO + bag-replay + perception services
+.env.example                      copy to .env, set LIVOX_LIDAR_IP (and BAG_PATH for replay)
 config/
   MID360_config.json.template     driver config with ${LIVOX_LIDAR_IP} etc.
   fastrtps_eth0_only.xml           DDS multicast whitelist (loopback + Ethernet only)
 ```
 
+`docker-compose.yml` has two profiles:
+
+- **`hardware`** -- `driver` + `fastlio`, for a real Mid-360 plugged into
+  this Jetson.
+- **`replay`** -- `fastlio` + `bag` + `perception`, for testing without a
+  real sensor by replaying one of Kei's recorded bags against a live
+  FastLIO instance instead. See `../perception/README.md` for what that's
+  actually validated so far.
+
+Every service needs a profile flag -- there is no profile-less default
+service in this file, so a bare `docker compose build`/`up` matches nothing
+and does nothing (Compose prints "No services to build" rather than an
+error, which is easy to miss).
+
 ## Build
 
 ```bash
-docker compose build
+docker compose --profile hardware build
 ```
 
 ## Run
@@ -36,7 +50,7 @@ docker compose build
 ```bash
 cp .env.example .env
 # edit .env: set LIVOX_LIDAR_IP to whichever Mid-360 is plugged into this dog
-docker compose up
+docker compose --profile hardware up
 ```
 
 This starts both the LiDAR driver and FastLIO. `docker-compose.yml` uses
@@ -49,10 +63,22 @@ Host networking isn't a convenience here, it's required.
 To run just one piece:
 
 ```bash
-docker compose up driver           # LiDAR driver only
-docker compose up fastlio           # FastLIO only (needs the driver already running)
-docker compose run --rm driver bash  # shell inside the built image
+docker compose --profile hardware up driver     # LiDAR driver only
+docker compose --profile hardware up fastlio    # FastLIO only (needs the driver already running)
+docker compose --profile hardware run --rm driver bash   # shell inside the built image
 ```
+
+No sensor to test against? `.env` also takes a `BAG_PATH` (a directory with
+`metadata.yaml` + a `.db3` file, e.g. one of Kei's recordings under
+`kei-stuff/ros2-go2/bag/`) for the `replay` profile:
+
+```bash
+docker compose --profile replay up
+```
+
+This runs FastLIO against a replayed bag instead of a live driver, plus the
+online perception node from `../perception/`. See `../perception/README.md`
+for what this has actually produced against real recorded data.
 
 ## What's already fixed vs what's still open
 
@@ -71,13 +97,26 @@ Baked into the image at build time:
   callback API. On Humble it isn't needed -- confirmed by building clean
   without it.
 
-Verified so far (see repo notes for the full record): both packages build
-clean under `-DDISTRO_ROS=humble`; the rendered LiDAR config picks up
-`LIVOX_LIDAR_IP`/`LIVOX_HOST_IP` correctly; both launch files parse and
-their arguments resolve; the driver fails with the expected, known
-`bind failed` error when no real LiDAR-subnet interface is present, which
-matches the documented real-hardware failure mode exactly rather than being
-a container-specific bug.
+Verified so far, by actually running it, not just building it:
+
+- Both packages build clean under `-DDISTRO_ROS=humble`; the rendered
+  LiDAR config picks up `LIVOX_LIDAR_IP`/`LIVOX_HOST_IP` correctly; both
+  launch files parse and their arguments resolve.
+- The driver fails with the expected, known `bind failed` error when no
+  real LiDAR-subnet interface is present, matching the documented
+  real-hardware failure mode exactly rather than being a container-specific
+  bug.
+- **FastLIO (from this image) correctly processes a real recorded Mid-360
+  bag end to end**: replayed one of Kei's Foxy-recorded sessions against
+  this image's `fastlio` service and got `/Odometry` + `/cloud_registered`
+  both publishing at ~10 Hz, matching the handover doc's documented
+  known-good result exactly. This isn't a live sensor, but it is real
+  recorded LiDAR/IMU data being fused correctly by this specific image --
+  see `../perception/README.md` for the full record, including a downstream
+  perception result built on top of it.
+- The full `docker compose --profile replay up` workflow (not just manual
+  `docker run` commands) has been run end to end and reproduces the same
+  result.
 
 Not yet verified: an actual Mid-360 talking to this container, an actual
 Jetson build, and whether CycloneDDS's node-creation segfault (which forced

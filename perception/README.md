@@ -22,8 +22,21 @@ available.
 
 ## Running it
 
-Needs the `docker/` image (`docker compose build` there first). Three
-pieces run together, each in host networking so they share the DDS domain:
+Needs the `docker/` image built first (`docker compose --profile hardware
+build` there -- the `--profile` flag is required, see `docker/README.md`).
+Easiest path is `docker/`'s `replay` profile, which runs FastLIO, this node,
+and a bag replay together:
+
+```bash
+cd ../docker
+cp .env.example .env
+# edit .env: set BAG_PATH to a directory containing metadata.yaml + a .db3
+# (e.g. kei-stuff/ros2-go2/bag/dog1/2026-05-12_16_21_soton_indoor)
+docker compose --profile replay up
+```
+
+Or run the three pieces by hand, each in host networking so they share the
+DDS domain:
 
 ```bash
 # 1. FastLIO (subscribes to /livox/lidar + /livox/imu, publishes
@@ -42,13 +55,8 @@ docker run --rm --network host \
     go2-lidar-humble:latest bash -c "ros2 bag play /bag"
 ```
 
-Or via `docker-compose.yml`'s `replay` profile (`BAG_PATH` set in `.env`):
-
-```bash
-docker compose --profile replay up
-```
-
-Watch detections with `docker logs -f perception`, or point RViz2 at
+Watch detections with `docker logs -f go2-online-perception` (or
+`perception` if run manually), or point RViz2 at
 `/online_perception/markers` (frame `camera_init`, matching FastLIO's own
 output frame) if running with a display available.
 
@@ -66,6 +74,10 @@ stationary Dog 1, person walking past):
   blips at longer range -- both the persistent tracks and the noise pattern
   match Kei's own documented finding for this exact session almost exactly.
   This is a real, verified result against real data, not a synthetic test.
+- Reproduced the identical result twice: once running each container by
+  hand (`docker run`), once via `docker compose --profile replay up` --
+  the documented one-command path isn't just a theoretical convenience
+  wrapper, it's been run and produces the same output.
 
 **Not yet done:**
 
