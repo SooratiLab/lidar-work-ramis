@@ -39,13 +39,23 @@ hasn't been tested.
   ~10 Hz odometry, matching Kei's own documented result on that session.
   See `docker/README.md` for setup and the full list of what's confirmed
   vs still open.
-- **`perception/`** -- a live ROS 2 node that reproduces Kei's offline
+- **`perception/`** -- a live ROS 2 node that ports Kei's offline
   `track_motion.py` pipeline (frame-to-frame background subtraction ->
-  DBSCAN clustering -> centroid tracking) as a direct subscriber to
+  DBSCAN clustering -> centroid tracking) to a direct subscriber on
   FastLIO's output, instead of a batch script over exported PCD files.
+  Tracking itself has since moved beyond a direct port: a constant-velocity
+  Kalman filter per track, globally-optimal (Hungarian) frame-to-frame
+  assignment, coasting through brief gaps, a minimum-hits confirmation step
+  to filter single-frame noise, and an odometry-based plausibility gate.
   Validated against a replayed bag standing in for a live sensor --
   reproduces Kei's own documented "2 tracks detected" result on the
-  `soton_indoor` session using the same tuned parameters, unchanged. See
-  `perception/README.md`.
+  `soton_indoor` session, and was reviewed against several more recorded
+  sessions (stationary, walking, walking-with-stops, degraded pre-fix data)
+  to build confidence before a Jetson port. That review found processing
+  time has a large margin on this hardware, but also found and quantified
+  a real open risk: a moving sensor produces substantially more false
+  positives than a stationary one, for reasons the current tracking-side
+  fixes can narrow but not fully solve. See `perception/README.md` for the
+  full writeup, including what's confirmed vs still open.
 - **Multi-dog map/track merging** -- not started yet, still at the
   planning stage.

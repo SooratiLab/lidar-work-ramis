@@ -10,8 +10,9 @@ changed and why.
 ## Layout
 
 - `online_perception_node.py` -- the ROS 2 node: subscribes to FastLIO's
-  topics, accumulates scans into frames, publishes RViz markers. Owns
-  nothing that isn't ROS-specific.
+  topics, accumulates scans into frames, publishes RViz markers. The only
+  non-ROS logic left in it is a trivial colour-picker for track markers,
+  not worth splitting out for its own tests.
 - `pointcloud.py` -- PointCloud2 parsing and voxel downsampling. Plain
   numpy, no rclpy dependency, so it's unit-testable on its own.
 - `tracking.py` -- DBSCAN clustering of the moved points, and the
@@ -25,14 +26,13 @@ changed and why.
 The eventual goal is a pipeline that runs live on the Jetson rather than
 "record bag -> ship to laptop -> replay through FastLIO -> run Python
 pipeline" after the fact. Building that against a live Mid-360 isn't
-possible yet (no LiDAR/Jetson reachable while writing this -- see
-`../TODO.md`), so this runs the same live-subscription code against a
-**replayed rosbag standing in for a live sensor** instead. `ros2 bag play`
-publishes at real time by default, so from this node's point of view a
-replayed bag looks the same as a live sensor feed -- the only difference is
-where the messages originate. This is a genuine step towards Phase 2, not a
-simulation of one; the same script runs unmodified once a live sensor is
-available.
+possible yet (no LiDAR/Jetson reachable so far), so this runs the same
+live-subscription code against a **replayed rosbag standing in for a live
+sensor** instead. `ros2 bag play` publishes at real time by default, so
+from this node's point of view a replayed bag looks the same as a live
+sensor feed -- the only difference is where the messages originate. This is
+a genuine step towards running on the Jetson, not a simulation of one; the
+same script runs unmodified once a live sensor is available.
 
 ## Tracking
 
@@ -122,7 +122,7 @@ reappear. Extending those limits to cover longer gaps isn't free (a longer
 constant-velocity extrapolation is also a less trustworthy one -- see the
 `max_missed_seconds` fix below); a proper fix would be re-identifying a new
 detection against a recently-dropped track's last known position rather
-than just coasting longer, which hasn't been built yet (see `../TODO.md`).
+than just coasting longer, which hasn't been built yet.
 
 **A moving sensor produces substantially more false positives than a
 stationary one -- confirmed and quantified, not just anecdotal.** Comparing
@@ -144,19 +144,20 @@ shows up as widespread spurious "moved" points across the whole scene, not
 just at the person's location -- this is a plausible mechanism, not
 independently confirmed against FastLIO's internal state, since no ground
 truth pose is available for this session. Either way, this is on top of the
-already-documented issue (Kei's handover, `../DOCS.md`) that a moving
-sensor's own field of view changing between frames makes newly-visible
-static geometry indistinguishable from a moving object, since the change
-detector only asks "was there a point near here in the previous frame,"
-not "could this location have been outside both frames' shared field of
-view." **Track confirmation (`min_hits`) filters the single-frame-noise
-half of this problem well** (`lab_walk_with_stops` still dropped from 361
-to 207 distinct tracks after the fix), but a large residual remains: 140
-of those tracks, spot-checked, were spatially and temporally consistent
-enough to survive 2-3 real detections without being a real object --
-tracking-side fixes (better assignment, filtering, coasting) can't fully
-solve a problem that originates in the detection step. See "Open risk for
-the Jetson port" below.
+already-documented issue (Kei's handover,
+`kei-stuff/Multi-LiDAR Sensing.pdf`) that a moving sensor's own field of
+view changing between frames makes newly-visible static geometry
+indistinguishable from a moving object, since the change detector only
+asks "was there a point near here in the previous frame," not "could this
+location have been outside both frames' shared field of view." **Track
+confirmation (`min_hits`) filters the single-frame-noise half of this
+problem well** (`lab_walk_with_stops` still dropped from 361 to 207
+distinct tracks after the fix), but a large residual remains: 140 of those
+tracks, spot-checked, were spatially and temporally consistent enough to
+survive 2-3 real detections without being a real object -- tracking-side
+fixes (better assignment, filtering, coasting) can't fully solve a problem
+that originates in the detection step. See "Open risk for the Jetson port"
+below.
 
 **Degraded/pre-DDS-fix recordings expose two real gaps, now fixed.**
 Replaying `dog1/2026-05-13_14_41_dds_test` (recorded before the DDS
@@ -259,7 +260,6 @@ Watch detections with `docker logs -f go2-online-perception` (or
 `/online_perception/markers` (frame `camera_init`, matching FastLIO's own
 output frame) if running with a display available.
 
-
 ## What's verified vs still open
 
 **Verified**, against `kei-stuff/ros2-go2/bag/dog1/2026-05-12_16_21_soton_indoor`
@@ -318,7 +318,8 @@ run):
 - Accumulate-then-cluster (fixed-size non-overlapping frames, mirroring
   `--accumulate 10` in the offline pipeline) is the simplest possible port
   of the existing algorithm, not necessarily the right online architecture
-  -- see `../TODO.md`'s Phase 2 notes on this.
+  -- a rolling/overlapping buffer might reduce detection latency and
+  jitter, but hasn't been investigated.
 - Multi-object re-identification after a real, multi-second occlusion or
   stop (as opposed to a single missed frame) isn't implemented -- see
   "Testing against more recorded sessions" above.
