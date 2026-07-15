@@ -18,8 +18,12 @@ changed and why.
 - `tracking.py` -- DBSCAN clustering of the moved points, and the
   frame-to-frame centroid tracker (Kalman filter + Hungarian assignment +
   coasting). Plain numpy/scipy/scikit-learn, no rclpy dependency.
-- `tests/` -- unit tests for `pointcloud.py` and `tracking.py` (see
-  "Testing" below).
+- `range_image.py` -- the odometry-referenced visibility gate that
+  suppresses "moved" points a moving sensor's own viewpoint change
+  produced, rather than something actually moving -- see "Visibility gate"
+  below. Plain numpy, no rclpy dependency.
+- `tests/` -- unit tests for `pointcloud.py`, `tracking.py`, and
+  `range_image.py` (see "Testing" below).
 
 ## Why this exists
 
@@ -90,6 +94,66 @@ concrete failure modes:
   used for something beyond logging -- see "Testing against more sessions"
   below for the failure mode it guards against.
 
+## Visibility gate: fixing the moving-sensor false-positive problem
+
+The methodology review below (see "Testing against more recorded
+sessions") identified and quantified a real problem the fixes above don't
+touch: a moving sensor produces far more false "moved" detections than a
+stationary one, because frame-to-frame nearest-neighbour change detection
+can't tell "this direction was outside the previous frame's view" from
+"something moved here." Rounding a corner, or just walking a metre closer
+to a wall, brings genuinely new static geometry into `/cloud_registered`
+that has no nearby point in the previous frame either -- exactly what the
+change-detection test is looking for in a real object.
+
+`range_image.py`'s `previously_visible_mask`, applied to the "moved" points
+in `online_perception_node.py` right after the existing nearest-neighbour
+test and before clustering, fixes this using `/Odometry` rather than
+tracking-side filtering (which can narrow the problem but, as the
+methodology review found, can't fully solve it). The approach:
+
+1. Bin the previous frame's points into a spherical grid (azimuth/
+   elevation) around the previous frame's own `/Odometry` position --
+   this is a range image, the same representation used for LiDAR
+   occlusion/dynamic-object reasoning in the wider literature (e.g.
+   Removert, ERASOR). Only position is needed, not orientation -- see the
+   module docstring for why the direction from a fixed origin to a
+   world-frame point doesn't depend on which way the sensor body happened
+   to be facing.
+2. For each "moved" candidate point in the current frame, look up the
+   previous frame's range image in the same direction from that same
+   origin. No entry -> the previous scan never reached that direction
+   (out of range, occluded, or just missed by sparse sampling -- doesn't
+   matter which) -> not evidence of motion, drop it. An entry that's
+   roughly the same range or farther -> the same static background,
+   possibly revealed at a new range because whatever used to be in front
+   of it (if anything) is no longer relevant -> also not motion, drop it.
+   Only a point genuinely closer than the previous range along that same
+   ray survives -- something now blocking a line of sight the previous
+   scan had clear to a farther surface, the actual signature of an object
+   moving into view.
+
+`range_image_azimuth_bins`/`range_image_elevation_bins` (default 72/36,
+5 degrees/bin) control the grid resolution. The first attempt used 2
+degrees/bin (180/90) and made things worse, not better: FastLIO's sparse
+~5k-points-per-frame output couldn't fill a grid that fine, so most of a
+real walking-pace track's own bins came up empty in the previous frame
+purely from sampling sparsity, not genuine unvisited directions, and the
+gate wrongly dropped most of a real track along with the false positives
+it was meant to catch (confirmed by rerunning `soton_indoor` and watching
+one of its two known-good tracks disappear after frame 6). Coarsening to
+5 degrees/bin fixed this -- rerunning the same session recovered both
+tracks at comparable point counts and speeds to the ungated result. This
+is a real tuning tradeoff, not a solved parameter: finer bins would
+localise occlusion boundaries more precisely if FastLIO's output were
+denser; these defaults are sized to the point density actually measured
+against recorded sessions, not derived from the Mid-360's spec sheet.
+
+`use_visibility_gate` (default `True`) turns this off entirely, for
+before/after comparison against the same recorded session without a code
+change -- see "Testing against more recorded sessions" below for the
+comparison this was validated with.
+
 ## Testing against more recorded sessions
 
 Beyond the `soton_indoor` session used to validate the initial rewrite (see
@@ -128,12 +192,18 @@ than just coasting longer, which hasn't been built yet.
 stationary one -- confirmed and quantified, not just anecdotal.** Comparing
 sessions:
 
-| session | sensor | duration | distinct tracks logged (before confirmation filter) |
-|---|---|---|---|
-| `soton_indoor` | stationary | ~24s | 7 |
-| `fallback_cardbox1` | stationary | ~86s | 38 |
-| `lab_walk_no_stop` | walking, continuous | ~38s | 22 |
-| `lab_walk_with_stops` | walking, stop-and-go | ~75s | 361 |
+| session | sensor | duration | distinct tracks logged (before confirmation filter) | after `min_hits` | after `min_hits` + visibility gate |
+|---|---|---|---|---|---|
+| `soton_indoor` | stationary | ~24s | 7 | 3 | 2 |
+| `fallback_cardbox1` | stationary | ~86s | 38 | 11 | 6 |
+| `lab_walk_no_stop` | walking, continuous | ~38s | 22 | 7 | 3 |
+| `lab_walk_with_stops` | walking, stop-and-go | ~75s | 361 | 207 | 15 |
+
+The last column is the visibility gate described above, added after this
+table's original findings identified the residual problem `min_hits`
+couldn't solve -- see "Visibility gate" above for the fix and "Validating
+the visibility gate against the moving-sensor problem" below for the
+validation run these numbers come from.
 
 `lab_walk_with_stops` stood out sharply: mean "moved" points per frame was
 843 (max 1548) versus `lab_walk_no_stop`'s mean of 263 (max 386) -- roughly
@@ -143,21 +213,23 @@ registration has to re-settle after, and any brief registration jitter
 shows up as widespread spurious "moved" points across the whole scene, not
 just at the person's location -- this is a plausible mechanism, not
 independently confirmed against FastLIO's internal state, since no ground
-truth pose is available for this session. Either way, this is on top of the
+truth pose is available for this session. Either way, this was on top of the
 already-documented issue (Kei's handover,
 `kei-stuff/Multi-LiDAR Sensing.pdf`) that a moving sensor's own field of
 view changing between frames makes newly-visible static geometry
 indistinguishable from a moving object, since the change detector only
 asks "was there a point near here in the previous frame," not "could this
 location have been outside both frames' shared field of view." **Track
-confirmation (`min_hits`) filters the single-frame-noise half of this
-problem well** (`lab_walk_with_stops` still dropped from 361 to 207
-distinct tracks after the fix), but a large residual remains: 140 of those
+confirmation (`min_hits`) filtered the single-frame-noise half of this
+problem well** (`lab_walk_with_stops` dropped from 361 to 207 distinct
+tracks from that fix alone), but a large residual remained: 140 of those
 tracks, spot-checked, were spatially and temporally consistent enough to
 survive 2-3 real detections without being a real object -- tracking-side
-fixes (better assignment, filtering, coasting) can't fully solve a problem
-that originates in the detection step. See "Open risk for the Jetson port"
-below.
+fixes (better assignment, filtering, coasting) couldn't fully solve a
+problem that originates in the detection step. The visibility gate, which
+does address the detection step directly, took `lab_walk_with_stops` from
+207 to 15 -- see "Validating the visibility gate against the moving-sensor
+problem" below for the full before/after validation.
 
 **Degraded/pre-DDS-fix recordings expose two real gaps, now fixed.**
 Replaying `dog1/2026-05-13_14_41_dds_test` (recorded before the DDS
@@ -188,23 +260,82 @@ own instability (a bad scan, a registration hiccup, a temporary DDS issue)
 won't silently produce confident-looking phantom detections -- it fails
 safe instead of failing invisibly.
 
-## Open risk for the Jetson port
+## Validating the visibility gate against the moving-sensor problem
 
-The single biggest remaining accuracy risk, based on the testing above, is
-the moving-sensor false-positive rate -- specifically that it is a
-*detection-side* problem (frame-to-frame nearest-neighbour change
-detection can't distinguish "newly visible because the sensor's field of
-view changed" from "genuinely moved"), not something addressable by
-further tracking-side refinement. `min_hits` narrows it considerably but
-doesn't solve it. A field deployment almost certainly involves a walking,
-not stationary, dog, so this is worth resolving -- or at least
-consciously deciding to accept -- before relying on this pipeline's output
-in the field. The most promising direction identified but not yet
-prototyped: use `/Odometry` to restrict change detection to the region of
-the current frame that was also within the previous frame's field of view,
-so newly-visible geometry at the edges stops being compared against
-"nothing was there before" by construction. This is a detection-algorithm
-change, not a tracking one, and hasn't been scoped in detail yet.
+Follow-up to the methodology review above, and the reason the visibility
+gate exists. The problem it targets was the single biggest remaining
+accuracy risk identified there: a moving sensor produces far more false
+positives than a stationary one, and it's a detection-side problem
+`min_hits` narrows but can't fully solve. Since a field deployment almost
+certainly means a walking dog, this was worth resolving, not just noting,
+before trusting this pipeline live.
+
+Validated by rerunning all four sessions from the table above -- same
+bags, same FastLIO instance, `use_visibility_gate` toggled with no other
+code changes, both runs subscribing to the same live replay so the
+comparison is against identical input, not two separate bag plays that
+could differ in timing:
+
+- **`soton_indoor` (stationary, the known-good baseline session): both
+  real tracks survive.** 3 confirmed tracks (after `min_hits`) drop to 2,
+  matching the handover's documented "2 real tracks" exactly -- the third
+  was the false positive being removed, not a real detection lost. Track
+  positions/speeds for the two survivors are within a few centimetres and
+  a few hundredths of a m/s of the ungated run's own numbers, confirming
+  the gate isn't just coincidentally arriving at the right count while
+  changing which detections make it through.
+- **Moving sessions show the same pattern the methodology review
+  predicted, at scale.** `lab_walk_no_stop` 7 -> 3, `fallback_cardbox1`
+  11 -> 6, `lab_walk_with_stops` 207 -> 15 (a 93% reduction on the session
+  that motivated this work in the first place). Total "moved" points
+  before clustering dropped 84-91% across all four sessions, including the
+  *stationary* ones -- some of what the plain nearest-neighbour test
+  flags even on a still sensor turns out to be edge/discretisation noise
+  the visibility gate also catches, not exclusively a moving-sensor
+  problem.
+- **The surviving tracks look like real detections, not an
+  over-aggressive filter left with nothing.** Every surviving track across
+  every session reports a walking-pace speed (0.24-1.61 m/s) and a
+  substantial point count (10-155 points), and in `lab_walk_no_stop`
+  specifically, the surviving tracks' positions trace the same continuous
+  path through the scene as the equivalent (higher-numbered, noisier)
+  tracks in the ungated run -- e.g. gated track 1's path from (0.79, 2.42)
+  to (3.67, 1.83) matches ungated track 10's (0.70, 2.43) to (4.13, 1.91)
+  almost exactly. This is the same real walking person in both runs, not a
+  different, coincidentally-plausible-looking detection.
+- **Getting there took one real tuning correction, not just picking a
+  resolution and moving on.** The first attempt (2 degrees/bin) made
+  `soton_indoor` *worse*: one of the two known-good tracks disappeared
+  after frame 6 because FastLIO's sparse ~5k-points-per-frame output
+  couldn't fill a grid that fine, so many of a real track's own bins came
+  up empty in the previous frame from sampling sparsity alone, not genuine
+  unvisited directions -- the gate dropped real motion along with the
+  false positives. Coarsening to 5 degrees/bin (the shipped default)
+  fixed this specific failure and is what the numbers above reflect; see
+  "Visibility gate" above for the reasoning and the resolution/density
+  tradeoff this exposed.
+- **Processing time stayed well inside budget.** 10-13ms mean, under 19ms
+  worst case across all four sessions with the gate on -- if anything
+  slightly lower than the pre-gate numbers in the table above, likely
+  because clustering has far fewer points to work with once the gate has
+  run. No frame in any session triggered the node's own 50%-of-budget
+  warning.
+
+**What this doesn't claim:** the gate is not proven to eliminate every
+moving-sensor false positive, only to substantially reduce them, and
+"looks like a plausible walking-pace track" (the check used above) is not
+the same as independently confirmed ground truth -- no session here has
+one. `lab_walk_with_stops`'s 15 surviving tracks, spread across a session
+with only one person walking, are consistent with the known,
+separately-documented re-identification gap (a person stopped for more
+than `max_missed_seconds` gets a new track ID on resuming, rather than
+being a fresh, unrelated false positive each time) rather than 15 distinct
+real objects -- plausible given the session, not independently verified
+detection-by-detection. The gate also only uses `/Odometry` position, not
+orientation (see `range_image.py`'s docstring for why that's sufficient
+for this specific check), and is tuned against four recorded sessions on
+one sensor's characteristic point density, not a live sensor or a broader
+set of scenes.
 
 ## Testing
 
@@ -214,9 +345,10 @@ python3 -m pytest tests/
 ```
 
 These cover the pure clustering/assignment/Kalman-filter/plausibility-gate
-logic in `tracking.py` and the PointCloud2 parsing/downsampling in
-`pointcloud.py` -- no ROS install, no bag file, no running node needed, so
-they're the fast repeatable check to run after touching either module. They
+logic in `tracking.py`, the PointCloud2 parsing/downsampling in
+`pointcloud.py`, and the range-image visibility check in `range_image.py`
+-- no ROS install, no bag file, no running node needed, so they're the
+fast repeatable check to run after touching any of the three modules. They
 do not exercise `online_perception_node.py` itself (the ROS wiring) -- that
 still needs the bag-replay check below.
 
@@ -251,9 +383,18 @@ docker run -d --rm --name perception --network host \
 
 # 3. Whatever's standing in for the sensor -- a bag, for now:
 docker run --rm --network host \
-    -v <path-to-a-kei-stuff-bag-directory>:/bag:ro \
+    -v <path-to-a-kei-stuff-bag-directory>:/bag:rw \
     go2-lidar-humble:latest bash -c "ros2 bag play /bag"
 ```
+
+Note the `:rw` mount on the bag, not `:ro` -- rosbag2's sqlite3 storage
+plugin needs write access to the bag's own directory to open it at all,
+even just for playback. A bag recorded without WAL/SHM sidecar files
+already sitting next to its `.db3` (some of Kei's earlier single-dog
+recordings, unlike the two-dog sessions that already carry them) fails
+under `:ro` with a misleading "Could not load/open plugin with storage id
+'sqlite3'" -- not an obvious permissions error, and easy to mistake for a
+corrupt bag.
 
 Watch detections with `docker logs -f go2-online-perception` (or
 `perception` if run manually), or point RViz2 at
@@ -301,20 +442,24 @@ run):
   itself doesn't know or care which it's talking to, but "the same code
   should work" and "confirmed working against a live sensor" are different
   claims -- don't conflate them in future notes.
-- The moving-sensor false-positive rate (see "Open risk for the Jetson
-  port" above) is the most important open accuracy question, and it's a
-  detection-side problem this round of testing identified and quantified
-  but didn't fix.
+- The moving-sensor false-positive rate is substantially reduced by the
+  visibility gate (see "Validating the visibility gate against the
+  moving-sensor problem" above) but not proven eliminated -- no session
+  tested has independently confirmed ground truth, so "the surviving
+  tracks look like plausible walking-pace detections" is the strongest
+  claim actually supported so far, not "every remaining track is
+  confirmed real."
 - No parameter re-tuning against a live sensor yet. The detection-side
   parameter defaults are carried over from `track_motion.py`'s offline
   FastLIO-tuned values; the Kalman noise, `min_hits`, `max_missed_seconds`,
-  and `max_sensor_range` parameters are new and were validated against
-  recorded sessions during this round of testing (see above) but not
-  against live sensor timing/density.
-- `/Odometry` is now used for the plausibility gate, but not yet for
-  motion-compensating detections or restricting change detection to the
-  overlapping field of view between frames -- the latter is the leading
-  candidate fix for the moving-sensor false-positive problem above.
+  `max_sensor_range`, and `range_image_*` parameters are new and were
+  validated against recorded sessions during this round of testing (see
+  above) but not against live sensor timing/density.
+- `/Odometry` is used for the plausibility gate and the visibility gate,
+  but not yet for motion-compensating detections within the
+  `accumulate_scans` window itself -- still worth checking whether
+  FastLIO's own per-scan registration already covers everything needed
+  here, independent of the FOV question the visibility gate addresses.
 - Accumulate-then-cluster (fixed-size non-overlapping frames, mirroring
   `--accumulate 10` in the offline pipeline) is the simplest possible port
   of the existing algorithm, not necessarily the right online architecture
@@ -322,4 +467,7 @@ run):
   jitter, but hasn't been investigated.
 - Multi-object re-identification after a real, multi-second occlusion or
   stop (as opposed to a single missed frame) isn't implemented -- see
-  "Testing against more recorded sessions" above.
+  "Testing against more recorded sessions" above. `lab_walk_with_stops`'s
+  15 surviving tracks after the visibility gate are the clearest evidence
+  this still matters: consistent with one person's walk being split across
+  many IDs by repeated stops, not 15 separate objects.

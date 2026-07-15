@@ -46,7 +46,16 @@ services:
     container_name: go2-bag-replay
     network_mode: host
     volumes:
-      - ${BAG_PATH:-.}:/bag:ro
+      # rosbag2's sqlite3 storage plugin needs write access to the bag's
+      # own directory even just to play it back -- it opens the database
+      # read-only, but a bag recorded without WAL/SHM sidecar files
+      # already present (e.g. kei-stuff's lab_walk_no_stop/
+      # lab_walk_with_stops sessions, unlike the two-dog recordings that
+      # already carry them) fails outright under :ro with a misleading
+      # "Could not load/open plugin with storage id 'sqlite3'" error, not
+      # an obvious permissions message. Confirmed by reproducing the
+      # failure under :ro and it going away under :rw.
+      - ${BAG_PATH:-.}:/bag:rw
     # Small delay so FastLIO's subscriber is up before the first message --
     # matches the manual "wait for Node init finished" step in
     # go2-jetson-setup.md; without it the bag's first IMU/LiDAR messages can

@@ -27,7 +27,9 @@ Subscribes:
     /cloud_registered   (sensor_msgs/PointCloud2)
     /Odometry            (nav_msgs/Odometry)  -- the robot's current
                           position gates implausible detections (see
-                          max_sensor_range below); not used to
+                          max_sensor_range below) and anchors each frame's
+                          range image for the visibility gate (see
+                          use_visibility_gate below); not used to
                           motion-compensate beyond what FastLIO already
                           bakes into /cloud_registered.
 
@@ -111,6 +113,84 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  far more likely to be
                                                  drifted odometry than a
                                                  real long-range return.
+    use_visibility_gate   (bool,  default True)  suppress "moved" points
+                                                 the previous frame's own
+                                                 sensor position couldn't
+                                                 have seen -- see
+                                                 range_image.py. This is the
+                                                 fix for the moving-sensor
+                                                 false-positive problem
+                                                 documented in
+                                                 perception/README.md's
+                                                 "Open risk for the Jetson
+                                                 port": on a moving sensor,
+                                                 newly-visible static
+                                                 geometry (rounding a
+                                                 corner, a wall the sensor
+                                                 just got closer to) has no
+                                                 nearby point in the
+                                                 previous frame either, and
+                                                 the plain change_threshold
+                                                 test alone can't tell that
+                                                 apart from something
+                                                 genuinely moving. Left as a
+                                                 parameter (rather than
+                                                 unconditional) so a
+                                                 before/after comparison
+                                                 against the same recorded
+                                                 session is one flag, not a
+                                                 code change.
+    range_image_azimuth_bins    (int, default 72)   horizontal resolution
+                                                 (5 degrees/bin) of the
+                                                 visibility gate's range
+                                                 image. Coarser than a
+                                                 first attempt at 2 degrees/
+                                                 bin (180 bins) -- testing
+                                                 against soton_indoor showed
+                                                 that resolution was finer
+                                                 than the ~5k points/frame
+                                                 FastLIO actually produces
+                                                 can fill: most bins in a
+                                                 person's own solid angle
+                                                 came up empty in the
+                                                 previous frame purely from
+                                                 sampling sparsity, not
+                                                 genuine unvisited
+                                                 directions, and the gate
+                                                 wrongly dropped most of a
+                                                 real, walking-pace track
+                                                 along with the false
+                                                 positives it was meant to
+                                                 catch.
+    range_image_elevation_bins  (int, default 36)   vertical resolution
+                                                 (5 degrees/bin), spanning
+                                                 the full +/-90 degrees --
+                                                 deliberately not narrowed
+                                                 to the Mid-360's actual
+                                                 vertical FOV, since a
+                                                 direction the sensor can't
+                                                 physically reach already
+                                                 shows up as an empty bin
+                                                 without needing to encode
+                                                 that separately (see
+                                                 range_image.py). Same
+                                                 sparsity reasoning as
+                                                 range_image_azimuth_bins
+                                                 above.
+    range_image_tolerance        (float, default 0.3)  metres a candidate
+                                                 point's range along a
+                                                 previously-seen direction
+                                                 must undercut the previous
+                                                 frame's range by before
+                                                 it's kept as "moved" --
+                                                 looser than
+                                                 change_threshold since this
+                                                 compares a single ray
+                                                 across two different
+                                                 viewpoints and a
+                                                 discretised bin, not
+                                                 nearest-neighbour distance
+                                                 within one point cloud.
     kalman_position_std   (float, default 0.1)   assumed centroid
                                                  measurement noise (m) --
                                                  how much a single DBSCAN
@@ -141,10 +221,11 @@ mm -> m), since that's the best available starting point for FastLIO's
 sparse, moving-sensor point density -- not re-derived from scratch here.
 They are a starting point, not a guarantee; re-tune against whatever this
 node's actual frame density turns out to be once running against a live
-sensor. The Kalman noise, min_hits, and max_sensor_range parameters are new
-and have no offline equivalent to carry over -- their defaults are reasoned
-(see each one's docstring above) and validated against recorded sessions
-during testing, not tuned against a live sensor yet.
+sensor. The Kalman noise, min_hits, max_sensor_range, and range_image_*
+parameters are new and have no offline equivalent to carry over -- their
+defaults are reasoned (see each one's docstring above) and validated
+against recorded sessions during testing, not tuned against a live sensor
+yet.
 """
 import colorsys
 import sys
@@ -159,16 +240,17 @@ from sensor_msgs.msg import PointCloud2
 from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
 
-# Local, non-ROS modules living alongside this script -- see pointcloud.py
-# and tracking.py for what moved out of this file and why. Explicit
-# sys.path insert (rather than relying on the script's directory already
-# being first on sys.path) so this still works if the node is ever launched
-# via `python3 -m` or an entry point instead of run as a plain script,
-# matching the same defensive pattern kei-stuff/lidar-perception/scripts
-# already uses for its own local imports.
+# Local, non-ROS modules living alongside this script -- see pointcloud.py,
+# tracking.py, and range_image.py for what moved out of this file and why.
+# Explicit sys.path insert (rather than relying on the script's directory
+# already being first on sys.path) so this still works if the node is ever
+# launched via `python3 -m` or an entry point instead of run as a plain
+# script, matching the same defensive pattern kei-stuff/lidar-perception/
+# scripts already uses for its own local imports.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pointcloud import pointcloud2_to_xyz, voxel_downsample
 from tracking import CentroidTracker, cluster_moved_points, filter_plausible_detections
+from range_image import build_range_image, previously_visible_mask
 
 
 def _track_colour(track_id: int) -> tuple:
@@ -199,6 +281,10 @@ class OnlinePerceptionNode(Node):
         self.declare_parameter("max_missed_seconds", 3.0)
         self.declare_parameter("min_hits", 2)
         self.declare_parameter("max_sensor_range", 40.0)
+        self.declare_parameter("use_visibility_gate", True)
+        self.declare_parameter("range_image_azimuth_bins", 72)
+        self.declare_parameter("range_image_elevation_bins", 36)
+        self.declare_parameter("range_image_tolerance", 0.3)
         self.declare_parameter("kalman_position_std", 0.1)
         self.declare_parameter("kalman_velocity_std", 2.0)
         self.declare_parameter("kalman_process_std", 1.0)
@@ -211,6 +297,10 @@ class OnlinePerceptionNode(Node):
         self._cluster_eps = self.get_parameter("cluster_eps").value
         self._cluster_min_points = self.get_parameter("cluster_min_points").value
         self._max_sensor_range = self.get_parameter("max_sensor_range").value
+        self._use_visibility_gate = self.get_parameter("use_visibility_gate").value
+        self._range_image_azimuth_bins = self.get_parameter("range_image_azimuth_bins").value
+        self._range_image_elevation_bins = self.get_parameter("range_image_elevation_bins").value
+        self._range_image_tolerance = self.get_parameter("range_image_tolerance").value
         self._z_max = self.get_parameter("z_max").value
         self._frame_id = self.get_parameter("frame_id").value
 
@@ -229,10 +319,12 @@ class OnlinePerceptionNode(Node):
         self._scan_buffer = []
         self._prev_frame = None            # downsampled points, last completed frame
         self._prev_frame_stamp = None
+        self._prev_frame_position = None   # sensor position (m) at that frame, for the visibility gate
         self._frame_count = 0
         self._scan_count = 0
         self._latest_odom = None
         self._logged_missing_odom_warning = False
+        self._logged_missing_odom_for_visibility_warning = False
         self._timing_samples = []  # last 50 _process_frame wall-clock durations (s)
 
         self._cloud_sub = self.create_subscription(
@@ -249,10 +341,19 @@ class OnlinePerceptionNode(Node):
             f"threshold={self._change_threshold} z_max={self._z_max}, "
             f"max_missed_frames={self._max_missed_frames}, "
             f"max_missed_seconds={self._max_missed_seconds}, "
-            f"max_sensor_range={self._max_sensor_range})")
+            f"max_sensor_range={self._max_sensor_range}, "
+            f"use_visibility_gate={self._use_visibility_gate})")
 
     def _odom_cb(self, msg: Odometry) -> None:
         self._latest_odom = msg
+
+    def _odom_position(self):
+        """Current /Odometry position (m) as a (3,) array, or None if no
+        /Odometry message has arrived yet."""
+        if self._latest_odom is None:
+            return None
+        p = self._latest_odom.pose.pose.position
+        return np.array([p.x, p.y, p.z])
 
     def _cloud_cb(self, msg: PointCloud2) -> None:
         points = pointcloud2_to_xyz(msg)
@@ -281,6 +382,13 @@ class OnlinePerceptionNode(Node):
         # sufficient) condition for the port to have a chance.
         processing_start = time.perf_counter()
 
+        # Sensor position "as of" this frame -- captured now, at the point
+        # this frame is complete, so it becomes the *previous* frame's
+        # reference position by the time the next frame runs the
+        # visibility gate below. Same snapshot-at-completion convention
+        # already used for the max_sensor_range plausibility gate.
+        frame_position = self._odom_position()
+
         frame = voxel_downsample(frame, self._voxel_size)
         if self._z_max is not None:
             frame = frame[frame[:, 2] <= self._z_max]
@@ -290,6 +398,7 @@ class OnlinePerceptionNode(Node):
         if self._prev_frame is None or len(self._prev_frame) == 0:
             self._prev_frame = frame
             self._prev_frame_stamp = stamp
+            self._prev_frame_position = frame_position
             self.get_logger().info(
                 f"frame {self._frame_count}: {len(frame)} pts "
                 f"({self._scan_count} scans so far) -- first frame, "
@@ -302,6 +411,8 @@ class OnlinePerceptionNode(Node):
         distances, _ = tree.query(frame, k=1)
         moved = frame[distances > self._change_threshold]
 
+        moved, n_unseen = self._apply_visibility_gate(moved)
+
         clusters = cluster_moved_points(moved, self._cluster_eps, self._cluster_min_points)
         clusters, n_implausible = self._drop_implausible_clusters(clusters)
 
@@ -312,12 +423,48 @@ class OnlinePerceptionNode(Node):
         self._log_frame_timing(processing_s, dt)
         self.get_logger().info(
             f"frame {self._frame_count}: {len(frame)} pts, "
-            f"{len(moved)} moved, {len(clusters)} clusters "
+            f"{len(moved)} moved ({n_unseen} dropped as previously "
+            f"unseen/background), {len(clusters)} clusters "
             f"({n_implausible} dropped as implausible) (dt={dt:.2f}s, "
             f"processed in {processing_s * 1000:.1f}ms)")
 
         self._prev_frame = frame
         self._prev_frame_stamp = stamp
+        self._prev_frame_position = frame_position
+
+    def _apply_visibility_gate(self, moved_points: np.ndarray):
+        """
+        Suppress "moved" points the previous frame's own sensor position
+        couldn't have told us anything about -- see range_image.py and
+        use_visibility_gate in the module docstring for the full
+        reasoning. Returns (surviving_points, n_dropped).
+
+        Fails open (no filtering) if disabled, if there are no candidate
+        points to check, or if no /Odometry has arrived yet to anchor the
+        previous frame's range image -- same rationale as
+        _drop_implausible_clusters below: refusing to detect anything
+        until odometry shows up is a worse failure mode than letting a
+        few frames through unfiltered while it's still arriving.
+        """
+        if not self._use_visibility_gate or len(moved_points) == 0:
+            return moved_points, 0
+
+        if self._prev_frame_position is None:
+            if not self._logged_missing_odom_for_visibility_warning:
+                self.get_logger().warning(
+                    "no /Odometry received yet -- visibility gate "
+                    "disabled until it arrives")
+                self._logged_missing_odom_for_visibility_warning = True
+            return moved_points, 0
+
+        prev_range_image = build_range_image(
+            self._prev_frame, self._prev_frame_position,
+            self._range_image_azimuth_bins, self._range_image_elevation_bins)
+        keep = previously_visible_mask(
+            moved_points, self._prev_frame_position, prev_range_image,
+            self._range_image_azimuth_bins, self._range_image_elevation_bins,
+            self._range_image_tolerance)
+        return moved_points[keep], int((~keep).sum())
 
     def _drop_implausible_clusters(self, clusters):
         """
@@ -340,11 +487,7 @@ class OnlinePerceptionNode(Node):
                 self._logged_missing_odom_warning = True
             return clusters, 0
 
-        sensor_position = np.array([
-            self._latest_odom.pose.pose.position.x,
-            self._latest_odom.pose.pose.position.y,
-            self._latest_odom.pose.pose.position.z,
-        ])
+        sensor_position = self._odom_position()
         filtered = filter_plausible_detections(clusters, sensor_position, self._max_sensor_range)
         return filtered, len(clusters) - len(filtered)
 

@@ -54,8 +54,14 @@ hasn't been tested.
   to build confidence before a Jetson port. That review found processing
   time has a large margin on this hardware, but also found and quantified
   a real open risk: a moving sensor produces substantially more false
-  positives than a stationary one, for reasons the current tracking-side
-  fixes can narrow but not fully solve. See `perception/README.md` for the
-  full writeup, including what's confirmed vs still open.
+  positives than a stationary one, for reasons tracking-side fixes alone
+  could narrow but not fully solve. An odometry-referenced visibility gate
+  (`range_image.py`) now addresses this directly -- rerunning the same
+  recorded sessions with it enabled cuts false tracks by 45-93% depending
+  on session (207 -> 15 on the worst one) while both real tracks in the
+  `soton_indoor` baseline still survive. See `perception/README.md` for the
+  full writeup, including what's confirmed vs still open -- most notably,
+  this is validated against recorded bags standing in for a live sensor,
+  not an actual moving dog yet.
 - **Multi-dog map/track merging** -- not started yet, still at the
   planning stage.
