@@ -34,15 +34,16 @@ Subscribes:
 Publishes:
     /online_perception/markers   (visualization_msgs/MarkerArray) -- one
                                    sphere + one text label per confirmed
-                                   track, viewable in RViz2 against the
-                                   same "camera_init" frame FastLIO
-                                   publishes in. Coasting tracks (predicted
-                                   position, no detection this frame) are
-                                   drawn at reduced opacity so it's visually
-                                   obvious when a track is being carried
-                                   through a gap rather than freshly
-                                   confirmed. Tentative tracks (fewer than
-                                   min_hits real detections so far) are not
+                                   track, viewable in RViz2 against
+                                   frame_id (default "camera_init", the
+                                   frame FastLIO itself publishes in).
+                                   Coasting tracks (predicted position, no
+                                   detection this frame) are drawn at
+                                   reduced opacity so it's visually obvious
+                                   when a track is being carried through a
+                                   gap rather than freshly confirmed.
+                                   Tentative tracks (fewer than min_hits
+                                   real detections so far) are not
                                    published at all -- see min_hits below.
 
 Parameters (all overridable via --ros-args -p <name>:=<value>):
@@ -127,6 +128,12 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  should expect between
                                                  frames
     z_max                 (float, default 2.5)   ceiling crop height (m)
+    frame_id               (str,   default "camera_init")  frame markers
+                                                 are published in -- match
+                                                 whatever frame FastLIO is
+                                                 actually publishing
+                                                 /cloud_registered in if
+                                                 that ever changes
 
 Defaults for the detection-side parameters match the FastLIO-tuned values in
 lidar-perception/README.md's track_motion.py parameter table (converted
@@ -298,7 +305,7 @@ class OnlinePerceptionNode(Node):
         clusters = cluster_moved_points(moved, self._cluster_eps, self._cluster_min_points)
         clusters, n_implausible = self._drop_implausible_clusters(clusters)
 
-        dt = stamp - self._prev_frame_stamp if self._prev_frame_stamp else 0.0
+        dt = stamp - self._prev_frame_stamp if self._prev_frame_stamp is not None else 0.0
         self._update_tracks(clusters, dt)
 
         processing_s = time.perf_counter() - processing_start
