@@ -27,8 +27,10 @@ This repo continues that work in two directions:
 No Go2, Jetson, or Mid-360 has been reachable yet during this work --
 everything below has been verified either on x86_64 as a stand-in for the
 Jetson's aarch64, or against Kei's recorded bags standing in for a live
-sensor. -- see each subdirectory's README for exactly what has and
-hasn't been tested.
+sensor. Both Jetsons are currently being reflashed to JetPack 6 (Ubuntu
+22.04), which will put them on native ROS 2 Humble rather than the
+Foxy+container fallback this repo's Docker work was hedging against -- see
+each subdirectory's README for exactly what has and hasn't been tested.
 
 ## What's here
 
@@ -43,25 +45,27 @@ hasn't been tested.
   `track_motion.py` pipeline (frame-to-frame background subtraction ->
   DBSCAN clustering -> centroid tracking) to a direct subscriber on
   FastLIO's output, instead of a batch script over exported PCD files.
-  Tracking itself has since moved beyond a direct port: a constant-velocity
-  Kalman filter per track, globally-optimal (Hungarian) frame-to-frame
-  assignment, coasting through brief gaps, a minimum-hits confirmation step
-  to filter single-frame noise, and an odometry-based plausibility gate.
-  Validated against a replayed bag standing in for a live sensor --
-  reproduces Kei's own documented "2 tracks detected" result on the
-  `soton_indoor` session, and was reviewed against several more recorded
-  sessions (stationary, walking, walking-with-stops, degraded pre-fix data)
-  to build confidence before a Jetson port. That review found processing
-  time has a large margin on this hardware, but also found and quantified
-  a real open risk: a moving sensor produces substantially more false
-  positives than a stationary one, for reasons tracking-side fixes alone
-  could narrow but not fully solve. An odometry-referenced visibility gate
-  (`range_image.py`) now addresses this directly -- rerunning the same
-  recorded sessions with it enabled cuts false tracks by 45-93% depending
-  on session (207 -> 15 on the worst one) while both real tracks in the
-  `soton_indoor` baseline still survive. See `perception/README.md` for the
-  full writeup, including what's confirmed vs still open -- most notably,
-  this is validated against recorded bags standing in for a live sensor,
-  not an actual moving dog yet.
+  Tracking itself has since moved well beyond a direct port: a
+  constant-velocity Kalman filter per track, globally-optimal (Hungarian)
+  frame-to-frame assignment, coasting through brief gaps, a minimum-hits
+  confirmation step to filter single-frame noise, an odometry-based
+  plausibility gate, an odometry-referenced visibility gate that fixes the
+  moving-sensor false-positive problem a stationary-only pipeline doesn't
+  have to deal with, and re-identification that bridges genuine stops or
+  occlusions beyond what coasting alone can trust. Validated against
+  replayed bags standing in for a live sensor across stationary, walking,
+  stop-and-go, degraded pre-fix, and (with real caveats found along the
+  way) outdoor sessions -- reproduces Kei's own documented "2 tracks
+  detected" result on `soton_indoor`, and the visibility gate cuts false
+  tracks by 45-93% depending on session while both real tracks in that
+  baseline still survive. An overlapping-frame architecture was
+  investigated as a latency improvement and rejected with data, and a
+  stage-by-stage performance profile found no library swap currently
+  justified -- this is the current priority: a solid single-LiDAR
+  implementation, tested and documented against recorded bags, before
+  live hardware testing or multi-dog merging. See `perception/README.md`
+  for the full writeup, including what's confirmed vs still open -- most
+  notably, this is all validated against recorded bags standing in for a
+  live sensor, not an actual moving dog yet.
 - **Multi-dog map/track merging** -- not started yet, still at the
   planning stage.

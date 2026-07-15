@@ -226,18 +226,20 @@ class CentroidTracker:
     filter, assigns this frame's cluster detections to tracks via
     globally-optimal matching gated by max_match_distance, updates matched
     tracks with their new measurement, starts new tracks for unmatched
-    detections, and coasts unmatched tracks (keeps predicting, no
-    measurement update) for up to max_missed_frames before dropping them --
-    or up to max_missed_seconds of real elapsed time, whichever comes
-    first. The frame-count limit alone isn't reliable on irregular data:
-    testing against a session with a degraded, bursty scan rate (pre-DDS-
-    fix recording conditions) found a track that survived a 42-second real
-    gap because only 3 *frames* happened to occur in that stretch, then
-    coasted its Kalman prediction across the whole gap and reported a
-    position 15+ metres from anything real. A constant-velocity
-    extrapolation is only trustworthy over the second or two coasting is
-    meant to bridge, not over tens of seconds -- max_missed_seconds catches
-    that case even when max_missed_frames hasn't been reached yet.
+    detections (after first checking recently-lost tracks for a
+    re-identification match, see below), and coasts unmatched tracks
+    (keeps predicting, no measurement update) for up to max_missed_frames
+    before dropping them -- or up to max_missed_seconds of real elapsed
+    time, whichever comes first. The frame-count limit alone isn't
+    reliable on irregular data: testing against a session with a
+    degraded, bursty scan rate (pre-DDS-fix recording conditions) found a
+    track that survived a 42-second real gap because only 3 *frames*
+    happened to occur in that stretch, then coasted its Kalman prediction
+    across the whole gap and reported a position 15+ metres from anything
+    real. A constant-velocity extrapolation is only trustworthy over the
+    second or two coasting is meant to bridge, not over tens of seconds --
+    max_missed_seconds catches that case even when max_missed_frames
+    hasn't been reached yet.
 
     Every track also carries an is_confirmed flag (hits >= min_hits).
     Testing against several recorded sessions showed that a large fraction
@@ -251,12 +253,39 @@ class CentroidTracker:
     counts as "confirmed" filters this whole category out of what gets
     logged/published, at the cost of one extra frame of latency (with the
     default min_hits=2) before a genuinely new object gets reported.
+
+    Re-identification (reid_max_distance, reid_window_seconds): coasting
+    is deliberately short (a second or two) because a constant-velocity
+    extrapolation stops being trustworthy beyond that. A real, deliberate
+    stop -- someone standing still behind an obstruction, or just pausing
+    -- lasts longer than that, so the track above gets dropped and the
+    same person gets a new ID when they reappear. Rather than extending
+    the coasting window itself (which would extrapolate an increasingly
+    untrustworthy velocity across the whole gap), a dropped track's last
+    known *position* (not an extrapolated one -- see below) is kept in a
+    short-lived "lost tracks" pool for up to reid_window_seconds. A new,
+    otherwise-unmatched detection that lands within reid_max_distance of a
+    pool entry revives that track's original ID (and its hit count, so a
+    previously-confirmed track doesn't lose its confirmed status) instead
+    of starting a fresh one. Velocity resets to zero on revival rather
+    than carrying over the pre-gap estimate -- the whole point of this
+    path is bridging a stop, so trusting the old velocity would defeat it
+    (someone who stopped isn't still moving at their old speed once they
+    resume, and someone who kept moving out of view entirely is exactly
+    the case reid_max_distance is meant to reject, not extrapolate
+    through). This deliberately only helps a genuine stop-in-place -- see
+    the class-level testing notes in perception/README.md for a real
+    session where the gap turned out to be a missed detection during
+    continued walking (the person had moved several metres by the time
+    they reappeared) rather than an actual stop, which no static-position
+    re-identification gate can or should bridge.
     """
 
     def __init__(self, max_match_distance: float, max_missed_frames: int = 3,
                  max_missed_seconds: float = 3.0, min_hits: int = 2,
                  position_variance: float = 0.01, velocity_variance: float = 4.0,
-                 process_variance: float = 1.0):
+                 process_variance: float = 1.0, reid_max_distance: float = 2.0,
+                 reid_window_seconds: float = 15.0):
         self._max_match_distance = max_match_distance
         self._max_missed_frames = max_missed_frames
         self._max_missed_seconds = max_missed_seconds
@@ -264,9 +293,16 @@ class CentroidTracker:
         self._position_variance = position_variance
         self._velocity_variance = velocity_variance
         self._process_variance = process_variance
+        self._reid_max_distance = reid_max_distance
+        self._reid_window_seconds = reid_window_seconds
 
         self.tracks = {}  # track_id -> KalmanTrack
         self._next_id = 0
+        self._elapsed_seconds = 0.0
+        # track_id -> {'position', 'hits', 'n_points', 'size', 'lost_at'}
+        # for tracks dropped within the last reid_window_seconds -- see
+        # "Re-identification" in the class docstring above.
+        self._lost_tracks = {}
 
     def step(self, detections: list, dt: float) -> dict:
         """
@@ -279,14 +315,21 @@ class CentroidTracker:
             model's predict step.
 
         Returns {track_id: {'track': KalmanTrack, 'is_new': bool,
-        'is_coasting': bool, 'is_confirmed': bool}} for every track active
-        this frame -- matched, newly created, or still within its coasting
-        window. is_new/is_coasting describe what happened to the track
-        *this frame*; is_confirmed describes the track's status overall
-        (hits >= min_hits) and is what callers should gate
-        logging/publishing on to avoid reporting single-frame noise as if
-        it were a real detection.
+        'is_coasting': bool, 'is_confirmed': bool, 'is_reidentified': bool}}
+        for every track active this frame -- matched, newly created,
+        re-identified, or still within its coasting window. is_new/
+        is_coasting/is_reidentified describe what happened to the track
+        *this frame* (mutually exclusive); is_confirmed describes the
+        track's status overall (hits >= min_hits) and is what callers
+        should gate logging/publishing on to avoid reporting single-frame
+        noise as if it were a real detection.
         """
+        self._elapsed_seconds += dt
+        self._lost_tracks = {
+            tid: info for tid, info in self._lost_tracks.items()
+            if self._elapsed_seconds - info["lost_at"] <= self._reid_window_seconds
+        }
+
         for track in self.tracks.values():
             track.predict(dt)
 
@@ -309,6 +352,7 @@ class CentroidTracker:
             track.n_points = detection.get("n_points", track.n_points)
             track.size = detection.get("size", track.size)
             active[tid] = {"track": track, "is_new": False, "is_coasting": False,
+                            "is_reidentified": False,
                             "is_confirmed": track.hits >= self._min_hits}
 
         for t_idx in unmatched_tracks:
@@ -318,13 +362,48 @@ class CentroidTracker:
             track.missed_seconds += dt
             if (track.missed > self._max_missed_frames
                     or track.missed_seconds > self._max_missed_seconds):
+                # Dropped from active tracking, but not forgotten outright
+                # -- keep its last known position on hand in case a
+                # detection reappears nearby within reid_window_seconds
+                # (see "Re-identification" above). This is the track's
+                # current (coasted) position, not its last real
+                # measurement -- KalmanTrack has no rollback -- but by the
+                # time a track has gone unmatched for multiple frames its
+                # velocity estimate is already exactly what a stop
+                # invalidates, so the coasted position is no less
+                # trustworthy than the last measured one here.
+                # reid_max_distance is sized as a generous gate for this
+                # reason, not a precise one.
+                self._lost_tracks[tid] = {
+                    "position": track.position.copy(),
+                    "hits": track.hits,
+                    "n_points": track.n_points,
+                    "size": track.size.copy(),
+                    "lost_at": self._elapsed_seconds,
+                }
                 del self.tracks[tid]
                 continue
             active[tid] = {"track": track, "is_new": False, "is_coasting": True,
+                            "is_reidentified": False,
                             "is_confirmed": track.hits >= self._min_hits}
 
         for d_idx in unmatched_detections:
             detection = detections[d_idx]
+            reid_tid = self._find_reid_match(detection["centroid"])
+
+            if reid_tid is not None:
+                lost = self._lost_tracks.pop(reid_tid)
+                track = KalmanTrack(reid_tid, detection["centroid"], self._position_variance,
+                                     self._velocity_variance, self._process_variance)
+                track.hits = lost["hits"]
+                track.n_points = detection.get("n_points", lost["n_points"])
+                track.size = detection.get("size", lost["size"])
+                self.tracks[reid_tid] = track
+                active[reid_tid] = {"track": track, "is_new": False, "is_coasting": False,
+                                     "is_reidentified": True,
+                                     "is_confirmed": track.hits >= self._min_hits}
+                continue
+
             tid = self._next_id
             self._next_id += 1
             track = KalmanTrack(tid, detection["centroid"], self._position_variance,
@@ -333,6 +412,22 @@ class CentroidTracker:
             track.size = detection.get("size", np.zeros(3))
             self.tracks[tid] = track
             active[tid] = {"track": track, "is_new": True, "is_coasting": False,
+                            "is_reidentified": False,
                             "is_confirmed": track.hits >= self._min_hits}
 
         return active
+
+    def _find_reid_match(self, position: np.ndarray):
+        """
+        Nearest lost track within both reid_max_distance and
+        reid_window_seconds of position, or None. Lost tracks are few and
+        short-lived by construction (purged every step in `step()`), so a
+        plain linear scan is simpler than justifying a KD-tree for what's
+        normally zero or one candidate.
+        """
+        best_tid, best_distance = None, None
+        for tid, info in self._lost_tracks.items():
+            distance = float(np.linalg.norm(position - info["position"]))
+            if distance <= self._reid_max_distance and (best_distance is None or distance < best_distance):
+                best_tid, best_distance = tid, distance
+        return best_tid

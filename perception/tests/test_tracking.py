@@ -274,3 +274,116 @@ def test_track_becomes_confirmed_after_min_hits_real_detections():
     result = tracker.step([], dt=1.0)
     assert result[track_id]["is_confirmed"] is True
     assert result[track_id]["is_coasting"] is True
+
+
+# --- re-identification (reid_max_distance / reid_window_seconds) -----------
+
+def test_reidentification_revives_original_id_after_coasting_expires():
+    tracker = CentroidTracker(max_match_distance=1.0, max_missed_frames=1,
+                               min_hits=2, reid_max_distance=1.0,
+                               reid_window_seconds=30.0)
+
+    tracker.step([{"centroid": np.array([0.0, 0.0, 0.0])}], dt=1.0)
+    result = tracker.step([{"centroid": np.array([0.1, 0.0, 0.0])}], dt=1.0)
+    (track_id, info) = next(iter(result.items()))
+    assert info["is_confirmed"] is True  # 2 real hits so far
+
+    # Drop the track entirely -- coasts out within max_missed_frames=1.
+    tracker.step([], dt=1.0)
+    result = tracker.step([], dt=1.0)
+    assert track_id not in result
+    assert track_id not in tracker.tracks
+
+    # Person reappears nearby a few seconds later (a real stop, not a
+    # missed detection while still moving) -- same ID, not a new one, and
+    # confirmed immediately since the hit count carries over.
+    result = tracker.step([{"centroid": np.array([0.2, 0.0, 0.0])}], dt=5.0)
+    assert track_id in result
+    assert result[track_id]["is_reidentified"] is True
+    assert result[track_id]["is_new"] is False
+    assert result[track_id]["is_confirmed"] is True
+
+
+def test_reidentification_rejects_match_beyond_distance_gate():
+    tracker = CentroidTracker(max_match_distance=1.0, max_missed_frames=1,
+                               min_hits=1, reid_max_distance=1.0,
+                               reid_window_seconds=30.0)
+
+    result = tracker.step([{"centroid": np.array([0.0, 0.0, 0.0])}], dt=1.0)
+    (track_id, _) = next(iter(result.items()))
+
+    tracker.step([], dt=1.0)
+    tracker.step([], dt=1.0)  # dropped, now in the lost-tracks pool
+
+    # Reappears 5 m away -- too far to plausibly be the same person having
+    # just stopped in place, so this must start a new track, not reuse the
+    # old ID.
+    result = tracker.step([{"centroid": np.array([5.0, 0.0, 0.0])}], dt=1.0)
+    (new_track_id, info) = next(iter(result.items()))
+    assert new_track_id != track_id
+    assert info["is_reidentified"] is False
+    assert info["is_new"] is True
+
+
+def test_reidentification_rejects_match_beyond_time_window():
+    tracker = CentroidTracker(max_match_distance=1.0, max_missed_frames=1,
+                               min_hits=1, reid_max_distance=2.0,
+                               reid_window_seconds=5.0)
+
+    result = tracker.step([{"centroid": np.array([0.0, 0.0, 0.0])}], dt=1.0)
+    (track_id, _) = next(iter(result.items()))
+
+    tracker.step([], dt=1.0)
+    tracker.step([], dt=1.0)  # dropped
+
+    # Reappears nearby, but well outside the 5-second reid_window_seconds.
+    result = tracker.step([{"centroid": np.array([0.1, 0.0, 0.0])}], dt=10.0)
+    (new_track_id, info) = next(iter(result.items()))
+    assert new_track_id != track_id
+    assert info["is_reidentified"] is False
+
+
+def test_reidentification_carries_over_hit_count_not_velocity():
+    tracker = CentroidTracker(max_match_distance=1.0, max_missed_frames=1,
+                               min_hits=2, reid_max_distance=5.0,
+                               reid_window_seconds=30.0)
+
+    # Build up a track moving steadily along x so it has a nonzero
+    # velocity estimate before it's lost. reid_max_distance is generous
+    # here specifically so the test doesn't depend on exactly how far the
+    # coasted prediction drifted before being dropped -- that's incidental
+    # to what this test is actually checking (velocity resets on revival).
+    tracker.step([{"centroid": np.array([0.0, 0.0, 0.0])}], dt=1.0)
+    result = tracker.step([{"centroid": np.array([1.0, 0.0, 0.0])}], dt=1.0)
+    (track_id, _) = next(iter(result.items()))
+    assert result[track_id]["track"].velocity[0] > 0.0
+
+    tracker.step([], dt=1.0)
+    tracker.step([], dt=1.0)  # dropped -- person has stopped, not still moving
+
+    result = tracker.step([{"centroid": np.array([1.2, 0.0, 0.0])}], dt=5.0)
+    revived = result[track_id]["track"]
+    # Velocity resets to zero on revival rather than carrying the pre-gap
+    # estimate through the stop -- see the class docstring for why.
+    np.testing.assert_allclose(revived.velocity, [0.0, 0.0, 0.0])
+
+
+def test_reidentification_pool_entry_expires_and_is_not_reused_twice():
+    tracker = CentroidTracker(max_match_distance=1.0, max_missed_frames=1,
+                               min_hits=1, reid_max_distance=1.0,
+                               reid_window_seconds=5.0)
+
+    result = tracker.step([{"centroid": np.array([0.0, 0.0, 0.0])}], dt=1.0)
+    (track_id, _) = next(iter(result.items()))
+
+    tracker.step([], dt=1.0)
+    tracker.step([], dt=1.0)  # dropped, pool entry age starts at 0
+
+    # Let the pool entry expire (age exceeds reid_window_seconds=5) before
+    # anything reappears.
+    tracker.step([], dt=10.0)
+
+    result = tracker.step([{"centroid": np.array([0.1, 0.0, 0.0])}], dt=1.0)
+    (new_track_id, info) = next(iter(result.items()))
+    assert new_track_id != track_id
+    assert info["is_reidentified"] is False

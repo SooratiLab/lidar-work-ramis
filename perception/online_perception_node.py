@@ -53,6 +53,40 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  see lidar-perception/
                                                  README.md's --accumulate
                                                  for the offline equivalent
+    accumulate_stride     (int,   default 0)      scans between processed
+                                                 frames -- 0 means "same as
+                                                 accumulate_scans" (the
+                                                 original behaviour: each
+                                                 frame is a fresh,
+                                                 non-overlapping window).
+                                                 Set lower than
+                                                 accumulate_scans to
+                                                 overlap consecutive
+                                                 frames and report more
+                                                 often -- e.g.
+                                                 accumulate_scans=10,
+                                                 accumulate_stride=5 halves
+                                                 the real-world latency
+                                                 between a new object
+                                                 appearing and its track
+                                                 reaching min_hits
+                                                 confirmations, at the cost
+                                                 of roughly double the
+                                                 clustering work per second
+                                                 (still well inside the
+                                                 processing budget measured
+                                                 during testing -- see
+                                                 perception/README.md's
+                                                 "Overlapping frames"
+                                                 section for the validated
+                                                 tradeoff). Overlap does
+                                                 not change what counts as
+                                                 "moved" between two
+                                                 frames -- it only changes
+                                                 how often a new frame
+                                                 boundary is drawn through
+                                                 the same underlying scan
+                                                 stream.
     voxel_size            (float, default 0.05)  downsample voxel size (m)
     change_threshold      (float, default 0.15)  moved-point distance (m)
     cluster_eps            (float, default 0.5)   DBSCAN radius (m)
@@ -92,6 +126,44 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  real detection (see
                                                  tracking.py's
                                                  CentroidTracker docstring)
+    reid_max_distance     (float, default 2.0)   metres a new detection
+                                                 must fall within of a
+                                                 recently-dropped track's
+                                                 last known position to
+                                                 revive that track's ID
+                                                 instead of starting a new
+                                                 one -- bridges a genuine
+                                                 stop or occlusion longer
+                                                 than max_missed_frames/
+                                                 max_missed_seconds without
+                                                 extending the coasting
+                                                 window itself (which would
+                                                 extrapolate an increasingly
+                                                 untrustworthy velocity
+                                                 across the whole gap
+                                                 instead). Deliberately
+                                                 gates on the last known
+                                                 *position*, not an
+                                                 extrapolated one -- see
+                                                 tracking.py's
+                                                 CentroidTracker docstring
+                                                 for why this only helps a
+                                                 real stop-in-place, not a
+                                                 missed detection during
+                                                 continued walking.
+    reid_window_seconds    (float, default 15.0)  how long a dropped
+                                                 track's last known
+                                                 position stays eligible
+                                                 for re-identification
+                                                 before being forgotten for
+                                                 good -- long enough to
+                                                 bridge a real pause, short
+                                                 enough that a much later,
+                                                 unrelated detection at the
+                                                 same spot doesn't
+                                                 incorrectly inherit an old
+                                                 track's identity and hit
+                                                 count.
     max_sensor_range      (float, default 40.0)  detections farther than
                                                  this from the robot's
                                                  current /Odometry position
@@ -230,6 +302,7 @@ yet.
 import colorsys
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -272,6 +345,7 @@ class OnlinePerceptionNode(Node):
         super().__init__("online_perception_node")
 
         self.declare_parameter("accumulate_scans", 10)
+        self.declare_parameter("accumulate_stride", 0)
         self.declare_parameter("voxel_size", 0.05)
         self.declare_parameter("change_threshold", 0.15)
         self.declare_parameter("cluster_eps", 0.5)
@@ -280,6 +354,8 @@ class OnlinePerceptionNode(Node):
         self.declare_parameter("max_missed_frames", 3)
         self.declare_parameter("max_missed_seconds", 3.0)
         self.declare_parameter("min_hits", 2)
+        self.declare_parameter("reid_max_distance", 2.0)
+        self.declare_parameter("reid_window_seconds", 15.0)
         self.declare_parameter("max_sensor_range", 40.0)
         self.declare_parameter("use_visibility_gate", True)
         self.declare_parameter("range_image_azimuth_bins", 72)
@@ -292,6 +368,11 @@ class OnlinePerceptionNode(Node):
         self.declare_parameter("frame_id", "camera_init")
 
         self._accumulate_scans = self.get_parameter("accumulate_scans").value
+        # 0 is a sentinel for "same as accumulate_scans" (the original,
+        # non-overlapping behaviour) -- lets accumulate_scans stay the
+        # single source of truth for the default instead of duplicating
+        # its value into a second parameter's default.
+        self._accumulate_stride = self.get_parameter("accumulate_stride").value or self._accumulate_scans
         self._voxel_size = self.get_parameter("voxel_size").value
         self._change_threshold = self.get_parameter("change_threshold").value
         self._cluster_eps = self.get_parameter("cluster_eps").value
@@ -306,6 +387,8 @@ class OnlinePerceptionNode(Node):
 
         self._max_missed_frames = self.get_parameter("max_missed_frames").value
         self._max_missed_seconds = self.get_parameter("max_missed_seconds").value
+        self._reid_max_distance = self.get_parameter("reid_max_distance").value
+        self._reid_window_seconds = self.get_parameter("reid_window_seconds").value
         self._tracker = CentroidTracker(
             max_match_distance=self.get_parameter("max_match_distance").value,
             max_missed_frames=self._max_missed_frames,
@@ -314,9 +397,12 @@ class OnlinePerceptionNode(Node):
             position_variance=self.get_parameter("kalman_position_std").value ** 2,
             velocity_variance=self.get_parameter("kalman_velocity_std").value ** 2,
             process_variance=self.get_parameter("kalman_process_std").value ** 2,
+            reid_max_distance=self._reid_max_distance,
+            reid_window_seconds=self._reid_window_seconds,
         )
 
-        self._scan_buffer = []
+        self._scan_buffer = deque(maxlen=self._accumulate_scans)
+        self._scans_since_last_frame = 0
         self._prev_frame = None            # downsampled points, last completed frame
         self._prev_frame_stamp = None
         self._prev_frame_position = None   # sensor position (m) at that frame, for the visibility gate
@@ -341,6 +427,8 @@ class OnlinePerceptionNode(Node):
             f"threshold={self._change_threshold} z_max={self._z_max}, "
             f"max_missed_frames={self._max_missed_frames}, "
             f"max_missed_seconds={self._max_missed_seconds}, "
+            f"reid_max_distance={self._reid_max_distance}, "
+            f"reid_window_seconds={self._reid_window_seconds}, "
             f"max_sensor_range={self._max_sensor_range}, "
             f"use_visibility_gate={self._use_visibility_gate})")
 
@@ -361,12 +449,24 @@ class OnlinePerceptionNode(Node):
         if len(points) == 0:
             return
 
+        # A fixed-size sliding window (deque, maxlen=accumulate_scans)
+        # rather than a list that gets cleared every accumulate_scans
+        # scans -- this is what makes accumulate_stride < accumulate_scans
+        # (overlapping frames) possible without restructuring anything
+        # else: the window always holds the most recent accumulate_scans
+        # scans, and a new frame is processed every accumulate_stride
+        # scans rather than only once the window has been completely
+        # replaced. With the default accumulate_stride == accumulate_scans
+        # this behaves exactly like the original clear-and-refill buffer.
         self._scan_buffer.append(points)
+        self._scans_since_last_frame += 1
         if len(self._scan_buffer) < self._accumulate_scans:
+            return
+        if self._scans_since_last_frame < self._accumulate_stride:
             return
 
         frame = np.concatenate(self._scan_buffer, axis=0)
-        self._scan_buffer = []
+        self._scans_since_last_frame = 0
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         self._process_frame(frame, stamp)
 
@@ -534,18 +634,22 @@ class OnlinePerceptionNode(Node):
             track = info["track"]
             speed = float(np.linalg.norm(track.velocity))
 
-            status = "new" if info["is_new"] else ("coasting" if info["is_coasting"] else "matched")
+            status = ("new" if info["is_new"]
+                       else "reidentified" if info["is_reidentified"]
+                       else "coasting" if info["is_coasting"]
+                       else "matched")
             self.get_logger().info(
                 f"  track {track_id} [{status}]: "
                 f"({track.position[0]:.2f}, {track.position[1]:.2f}, "
                 f"{track.position[2]:.2f}) m, {track.n_points} pts, "
                 f"{speed:.2f} m/s")
-            markers.markers.extend(self._build_markers(track_id, track, speed, info["is_coasting"]))
+            markers.markers.extend(
+                self._build_markers(track_id, track, speed, info["is_coasting"], info["is_reidentified"]))
 
         if markers.markers:
             self._marker_pub.publish(markers)
 
-    def _build_markers(self, track_id, track, speed, is_coasting):
+    def _build_markers(self, track_id, track, speed, is_coasting, is_reidentified):
         colour = _track_colour(track_id)
         centroid = track.position
         now = self.get_clock().now().to_msg()
@@ -583,7 +687,13 @@ class OnlinePerceptionNode(Node):
         label.scale.z = 0.25
         label.color.r, label.color.g, label.color.b = colour
         label.color.a = 1.0 if not is_coasting else 0.6
-        suffix = " (coasting)" if is_coasting else ""
+        # Re-identification (see reid_max_distance/reid_window_seconds in
+        # the module docstring) is visually distinguished from an ordinary
+        # coast-then-match the same way coasting itself is faded out --
+        # this is the one frame where it's useful to see that a track's ID
+        # just survived a gap much longer than a normal coast, not just
+        # that it matched.
+        suffix = " (coasting)" if is_coasting else " (re-identified)" if is_reidentified else ""
         label.text = f"track {track_id}: {speed:.2f} m/s{suffix}"
         label.lifetime.sec = 1
 

@@ -17,7 +17,8 @@ changed and why.
   numpy, no rclpy dependency, so it's unit-testable on its own.
 - `tracking.py` -- DBSCAN clustering of the moved points, and the
   frame-to-frame centroid tracker (Kalman filter + Hungarian assignment +
-  coasting). Plain numpy/scipy/scikit-learn, no rclpy dependency.
+  coasting + re-identification after longer gaps). Plain numpy/scipy/
+  scikit-learn, no rclpy dependency.
 - `range_image.py` -- the odometry-referenced visibility gate that
   suppresses "moved" points a moving sensor's own viewpoint change
   produced, rather than something actually moving -- see "Visibility gate"
@@ -93,6 +94,85 @@ concrete failure modes:
   ever reach the tracker. This is the one place `/Odometry` is actually
   used for something beyond logging -- see "Testing against more sessions"
   below for the failure mode it guards against.
+- **Re-identification** (`reid_max_distance`, `reid_window_seconds`): a
+  track dropped after coasting out keeps its last known position on hand
+  for up to `reid_window_seconds`, and a new, otherwise-unmatched detection
+  within `reid_max_distance` of it revives the original ID (and hit count)
+  instead of starting a fresh one. This is deliberately a second, longer
+  mechanism layered on top of coasting rather than an extension of it --
+  see "Re-identification" below for why extending coasting itself would be
+  the wrong fix, and for what this does and doesn't bridge.
+
+## Re-identification: bridging genuine stops without trusting a long coast
+
+Coasting (above) is deliberately short -- a second or two -- because a
+constant-velocity extrapolation stops being trustworthy beyond that. A
+real, deliberate stop (someone pausing, or a genuine multi-second
+occlusion) lasts longer, so the track above gets dropped and the same
+person gets a new ID on reappearing. This was flagged as an open gap in
+the methodology review below (see `fallback_cardbox1`'s physical-occlusion
+scenario) and is the clearest remaining identity-continuity problem the
+visibility gate above doesn't touch -- it fixes false detections, not
+this.
+
+Rather than extending `max_missed_frames`/`max_missed_seconds` themselves
+(which would mean coasting a Kalman prediction across the whole gap on
+an increasingly untrustworthy velocity estimate), a dropped track's last
+known *position* is kept in a short-lived pool (`CentroidTracker`'s
+`_lost_tracks`) for up to `reid_window_seconds`. A new, otherwise-unmatched
+detection within `reid_max_distance` of a pool entry revives that track's
+original ID -- and its hit count, so a previously-confirmed track doesn't
+lose its confirmed status and get reported with an extra frame of latency
+as if it were brand new. Velocity resets to zero on revival rather than
+carrying over the pre-gap estimate: the point of this path is bridging a
+stop, so trusting the old velocity would defeat it.
+
+**This deliberately only helps a genuine stop-in-place.** A detection
+missed while the person kept walking -- rather than actually stopping --
+can end up metres from where the track was lost by the time it
+reappears, which no static-position gate can or should bridge (a generous
+enough gate to catch that would just as easily misattribute an unrelated
+object's detection to an old, stale ID). This is a real, observed
+distinction, not a hypothetical caveat: manually reconstructing gaps in
+`lab_walk_with_stops`'s track log found one gap where the last and next
+positions were 7.6 m apart over a 5 s window (~1.5 m/s -- the person kept
+walking, undetected, rather than stopping) alongside several genuine
+stops with sub-2-metre drift over similar or longer gaps -- exactly the
+distinction `reid_max_distance` is meant to draw.
+
+**Validated by rerunning the same four sessions**, `reid_window_seconds`
+set to 0 (which structurally disables re-identification -- there's no
+route by which a same-step revival could apply, since a track can only
+enter the lost-tracks pool after the assignment step has already run) for
+the "off" comparison:
+
+- Re-identification fired 12 times across 7 distinct original track IDs in
+  `lab_walk_with_stops`, and once in `fallback_cardbox1`; zero times in
+  `soton_indoor` or `lab_walk_no_stop` (both short sessions without a real
+  stop-length gap). Observed real gaps it successfully bridged ranged from
+  1 s to 12 s -- direct evidence for `reid_window_seconds=15.0`'s default
+  being in the right range, not just reasoned from first principles.
+- **The effect on the *distinct confirmed track* count is smaller than
+  might be expected, and it's worth being honest about why.** Comparing
+  internal track-ID allocation (not just what got confirmed and logged)
+  tells the real story: in `lab_walk_with_stops`, IDs climbed to 61 with
+  re-identification off versus only 24 with it on -- far fewer identities
+  were ever allocated in the first place, because repeatedly-flickering
+  detections kept reclaiming their original ID instead of spinning up a
+  new one each time. But the *logged* count barely moved (14 -> 13),
+  because `min_hits` was already suppressing most of those extra
+  reappearances from ever being confirmed and logged in the "off" case too
+  -- a flickering detection that gets only one hit before disappearing
+  again isn't reported either way. Re-identification's real benefit here
+  is fewer wasted internal tracks and immediate confirmed status on
+  revival (since the hit count carries over), not a dramatically smaller
+  reported track count on this particular dataset.
+- No processing-time regression: 10-14ms mean, under 28ms worst case
+  across all four sessions with re-identification on.
+
+Unit tests (`perception/tests/test_tracking.py`) cover revival within the
+distance/time gates, rejection beyond either gate, velocity resetting on
+revival, and pool-entry expiry.
 
 ## Visibility gate: fixing the moving-sensor false-positive problem
 
@@ -337,6 +417,161 @@ for this specific check), and is tuned against four recorded sessions on
 one sensor's characteristic point density, not a live sensor or a broader
 set of scenes.
 
+## Overlapping frames: an investigated, rejected optimisation
+
+`accumulate_stride` (see the module docstring) lets frames overlap --
+processing every `accumulate_stride` scans instead of waiting for a fresh
+`accumulate_scans`-scan window each time, e.g. `accumulate_scans=10,
+accumulate_stride=5` for 50% overlap. This was implemented and A/B tested
+specifically to check whether it reduces detection latency (how long
+after a new object appears before its track reaches `min_hits` and gets
+reported), since more frequent frames means more frequent chances to
+accumulate a confirming second hit.
+
+**Tested against `lab_walk_no_stop`** (two instances of the node
+subscribing to the same live FastLIO+bag-replay run, `accumulate_stride=10`
+vs `accumulate_stride=5`, everything else default): the overlapping run
+processed exactly 2x the frames (76 vs 38) for roughly 1.9x the total CPU
+time (781ms vs 412ms across the whole session) -- unsurprising, and still
+trivial against the processing budget either way. What it did *not* do is
+reduce detection latency: the three real tracks were first confirmed
+within about a second of each other between the two runs, in both
+directions (one track was confirmed slightly *later* with overlap
+enabled). The reason shows up directly in the per-frame "moved" point
+counts: mean moved points per frame roughly halved (27.2 -> 11.3) under
+50% overlap, because each frame now spans half the real time, so a moving
+object has covered half the distance and displaced half as many points
+past `change_threshold` by the time each frame is compared. Reporting
+twice as often but with roughly half the signal each time nets out to
+about the same *time* to reach `min_hits` confirmations, not half of it,
+because confirmation latency here is paced by real elapsed time and
+object speed, not by frame count.
+
+**Kept as an opt-in parameter, not adopted as the default.** The
+experiment was worth running -- it's exactly the kind of architecture
+question flagged as open in earlier planning -- but it doubles compute
+for no measured benefit on the one session tested, and "keep the working
+non-overlapping behaviour as default, leave a tested escape hatch in
+place" fits this project's priority right now (a good working single-LiDAR
+implementation before more moving pieces) better than carrying extra
+runtime complexity for an unproven win. Worth revisiting if a live sensor
+ever shows different timing characteristics than this recorded-bag test,
+or if `change_threshold`/`cluster_min_points` get re-tuned specifically
+for a shorter inter-frame interval rather than reused unchanged from the
+non-overlapping defaults, as they were here.
+
+## Outdoor deployment session: a data-quality finding, not a clean test
+
+`kei-stuff/ros2-go2/bag/2026-05-08_12_10_dog_2_outdoor_deployment` is the
+largest recorded session (842 MB) and the only outdoor one with the kind
+of scene this pipeline eventually needs to handle in the field (per the
+handover's artefact catalogue: two walkers and a cyclist, dog 2). It
+hadn't been tested against any version of this pipeline yet, so it was a
+natural next session to run -- but what it actually revealed was about the
+recording itself, not the tracker.
+
+**The bag was missing its `metadata.yaml`** -- `ros2 bag play` can't open
+a bag without one. `ros2 bag reindex <bag_dir>` (works directly against
+the `.db3`, ROS 2 Humble) reconstructed it on a scratch copy without
+touching the original file under `kei-stuff/`.
+
+**LiDAR data only covers the first ~186 s of a ~1724 s (28.7-minute)
+recording** -- confirmed directly from the bag's own message timestamps,
+not inferred: `/livox/imu` spans the full 1724 s at a steady ~200 Hz with
+no large gaps, while `/livox/lidar` stops entirely at the 186 s mark and
+never resumes, despite IMU recording continuing for another 26 minutes.
+The most likely explanation is the LiDAR driver dropping outdoors (WiFi/
+DDS fragility is a documented risk elsewhere in this project) without
+whoever was recording noticing before stopping the bag. This means the
+two-walkers-and-a-cyclist scene described in the artefact catalogue, if it
+happened later in the walk, is outside what this recording can actually
+test -- worth flagging as a concrete argument for a "is `/livox/lidar`
+still publishing" sanity check during future field recording, not just at
+setup.
+
+**FastLIO showed the same degraded-registration symptoms as the
+pre-DDS-fix sessions** (`No Effective Points!`, `lidar loop back, clear
+buffer`) during the ~186 s that did have LiDAR data -- so this recording
+is closer to the pathological `dds_test` category than a clean baseline,
+and its numbers shouldn't be read as representative outdoor performance.
+
+**What was still worth checking, and did check out**: running the current
+pipeline (visibility gate + re-identification, defaults) against this
+segment (bounded to ~210 s of playback, matching the ~186 s of actual
+LiDAR data) produced 17 confirmed tracks, all with plausible walking-pace
+speeds (0-1.8 m/s, no cyclist-speed readings -- consistent with the
+cyclist likely being later in the walk than this data covers) and
+positions bounded within a ~20 m x ~13 m region, not scattered or
+diverging. `max_sensor_range` never dropped a single detection as
+implausible, meaning FastLIO's registration -- despite the warnings --
+never actually produced a wildly drifted `/cloud_registered` point during
+this window. This matches the design goal from the visibility-gate work:
+degraded input produces a plausible-looking result or a clean rejection,
+not a confident-looking phantom. It does **not** confirm the pipeline
+correctly detected two walkers and a cyclist -- there's no ground truth
+for this specific 186-second segment to check against.
+
+## Performance profile and library choices
+
+Every prior round of testing measured *total* per-frame processing time
+(8-40ms mean, well inside budget); this round broke that down by pipeline
+stage, using real per-frame timing added temporarily to
+`online_perception_node.py` and run against `lab_walk_with_stops` (the
+most demanding session so far), to answer the question "if this needs to
+be faster on a Jetson, or point density increases, where would that time
+actually have to come from" with data instead of a guess:
+
+| stage | mean | share of total |
+|---|---|---|
+| KD-tree build + nearest-neighbour query (`scipy.spatial.cKDTree`) | 6.2ms | ~46% |
+| Kalman predict/update + Hungarian assignment (`tracking.py`) | 2.4ms | ~17% |
+| Voxel downsample (`pointcloud.py`) | 2.2ms | ~16% |
+| Visibility gate (`range_image.py`) | 1.7ms | ~13% |
+| DBSCAN clustering (`sklearn.cluster.DBSCAN`) | 1.1ms | ~8% |
+
+**No library swap is justified right now.** Total mean processing time
+(~13.6ms) is roughly 1% of the accumulate-scans real-time budget
+(~1 second) on this laptop's x86_64 CPU -- even a generously pessimistic
+5-10x slowdown for a Jetson's weaker per-core performance leaves 90%+ of
+the budget spare. Specifically:
+
+- **The KD-tree query is the single biggest cost, but scipy's `cKDTree`
+  is already a well-optimised compiled implementation** -- there's no
+  obvious faster off-the-shelf alternative for exact nearest-neighbour
+  queries at this scale, and approximate-neighbour libraries (e.g.
+  FAISS) trade accuracy for speed the pipeline doesn't need yet. Worth
+  re-profiling if point density increases substantially (query cost
+  scales with point count), since density is the improvement Kei's
+  handover and this project's own findings both flag as the most
+  impactful lever for detection quality generally -- but that's a reason
+  to *re-profile later*, not to pre-optimise now.
+- **DBSCAN turned out to be the cheapest stage, not a bottleneck worth
+  replacing** -- worth recording since it's the opposite of what its
+  reputation as "the slow clustering algorithm" might suggest; at this
+  point count (a few hundred to low thousands of "moved" points per
+  frame, not the tens of thousands DBSCAN's complexity concerns usually
+  apply to) it's a non-issue.
+- **The hand-rolled Kalman filter and Hungarian assignment were
+  considered against `filterpy` (a well-tested Kalman filter library)
+  and `lap`/`lapjv` (faster Hungarian solvers for large cost matrices)
+  and rejected**, not overlooked: `tracking.py`'s filter is already
+  unit-tested against known-good behaviour (constant-velocity
+  convergence, coasting), simple enough to audit by reading it, and
+  `scipy.optimize.linear_sum_assignment` is solving matrices with at
+  most a handful of tracks -- `lap`'s speed advantage only matters at a
+  scale (hundreds of simultaneous tracks) this pipeline is nowhere near.
+  Adding a dependency to solve a performance problem that doesn't exist
+  would be net-negative for maintainability, not neutral.
+
+**The honest general conclusion**: this pipeline's bottleneck, if it
+turns out to have one on real hardware, is far more likely to be FastLIO
+itself (a heavier C++ SLAM system this project doesn't control the
+internals of) than anything in `perception/`'s few milliseconds of numpy/
+scipy/scikit-learn work. Effort is better spent on point-cloud density
+and detection accuracy -- both flagged repeatedly elsewhere in this
+project's findings as the real levers -- than on speeding up a stage
+that's already using a tiny fraction of its budget.
+
 ## Testing
 
 ```bash
@@ -452,22 +687,35 @@ run):
 - No parameter re-tuning against a live sensor yet. The detection-side
   parameter defaults are carried over from `track_motion.py`'s offline
   FastLIO-tuned values; the Kalman noise, `min_hits`, `max_missed_seconds`,
-  `max_sensor_range`, and `range_image_*` parameters are new and were
-  validated against recorded sessions during this round of testing (see
-  above) but not against live sensor timing/density.
+  `max_sensor_range`, `range_image_*`, and `reid_*` parameters are new and
+  were validated against recorded sessions during this round of testing
+  (see above) but not against live sensor timing/density.
 - `/Odometry` is used for the plausibility gate and the visibility gate,
   but not yet for motion-compensating detections within the
   `accumulate_scans` window itself -- still worth checking whether
   FastLIO's own per-scan registration already covers everything needed
   here, independent of the FOV question the visibility gate addresses.
-- Accumulate-then-cluster (fixed-size non-overlapping frames, mirroring
-  `--accumulate 10` in the offline pipeline) is the simplest possible port
-  of the existing algorithm, not necessarily the right online architecture
-  -- a rolling/overlapping buffer might reduce detection latency and
-  jitter, but hasn't been investigated.
-- Multi-object re-identification after a real, multi-second occlusion or
-  stop (as opposed to a single missed frame) isn't implemented -- see
-  "Testing against more recorded sessions" above. `lab_walk_with_stops`'s
-  15 surviving tracks after the visibility gate are the clearest evidence
-  this still matters: consistent with one person's walk being split across
-  many IDs by repeated stops, not 15 separate objects.
+- Accumulate-then-cluster with a fixed-size window is still the
+  architecture, but the specific "overlapping window might reduce
+  latency" question is no longer open -- it was investigated and rejected
+  with data, not left untried (see "Overlapping frames" above). What's
+  still genuinely open is whether a different windowing scheme entirely
+  (not just overlap) would help, which hasn't been explored.
+- Re-identification after a real, multi-second occlusion or stop is
+  **implemented and validated against recorded sessions** (see
+  "Re-identification" above) -- this closes what was previously the
+  clearest open gap here. What's still open: it only bridges a genuine
+  stop-in-place (gated on the last known *position*), not a detection
+  missed while the object kept moving, which a real session in this
+  round of testing showed is also a real failure mode (a 7.6 m gap over
+  5 s -- the person kept walking, undetected, rather than stopping) and
+  which no static-position re-identification scheme can safely bridge.
+- The outdoor deployment session (`2026-05-08_12_10_dog_2_outdoor_deployment`)
+  turned out to be a data-quality problem, not a clean test -- see
+  "Outdoor deployment session" above. The pipeline behaved safely against
+  degraded input (no phantom far detections, bounded plausible positions),
+  but the two-walkers-and-a-cyclist scene this session was meant to test
+  against likely occurred later in the walk than the ~186s of actual LiDAR
+  data the recording contains, so this specific claim is still untested.
+  A short, clean outdoor recording (LiDAR confirmed publishing throughout)
+  would be a more useful test than re-running this one.
