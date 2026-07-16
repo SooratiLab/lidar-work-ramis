@@ -75,3 +75,84 @@ each subdirectory's README for exactly what has and hasn't been tested.
   of log excerpts. See `evaluation/README.md`.
 - **Multi-dog map/track merging** -- not started yet, still at the
   planning stage.
+
+## Usage
+
+Two different workflows, depending on whether there's a sensor/bag
+involved at all:
+
+### Offline: evaluating the tracking pipeline against recorded data
+
+The fastest way to run or tune the tracking algorithm itself -- no Docker,
+no ROS, no FastLIO build. `perception/tracking.py`, `pointcloud.py`, and
+`range_image.py` have no `rclpy` dependency (see `perception/README.md`),
+so `evaluation/` runs them directly against a session's already-exported
+PCD frames + poses CSV.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r evaluation/requirements.txt
+
+# a session already lives under data/ -- see evaluation/README.md for
+# which ones and where they came from
+python3 evaluation/compare_pipelines.py data/2026-05-12_soton_indoor_dog1 \
+    --kei-tracks ../kei-stuff/lidar-perception/output/2026-05-12_indoor/soton_indoor_dog1_tracks.csv
+```
+
+Writes a tracks CSV, a frame-by-frame gif, and (with `--kei-tracks`)
+trajectory/speed/track-count comparison plots to `output/<session>/`. See
+`evaluation/README.md` for the full option list and what each output
+actually shows.
+
+This only works against a session that's already been exported to PCD
+frames + a poses CSV (`data/<session>/pcd/frame_*.pcd` + `poses.csv`) --
+a handful of Kei's sessions already are, copied in from
+`kei-stuff/lidar-perception/data/`. Turning a *new* raw bag into that
+format still means Kei's original WSL2/FastLIO/`export_fastlio.py`
+workflow (`kei-stuff/ros2-go2/laptop-wsl-setup.md`,
+`kei-stuff/lidar-perception/README.md`) -- there's no Docker-based
+one-command path from bag to exported frames yet. Once real hardware is
+reachable, running the bag live through the `replay`/`hardware` Docker
+setup below and recording its own output is the more likely direction,
+rather than building a second offline exporter.
+
+### Live (or bag-replay-standing-in-for-live): running the actual ROS node
+
+`docker/` builds the one Docker image everything else runs in --
+`livox_ros_driver2` + FastLIO on ROS 2 Humble -- and `docker-compose.yml`
+wires it up two ways:
+
+```bash
+cd docker
+cp .env.example .env   # set LIVOX_LIDAR_IP for whichever dog this is
+
+# a real Mid-360 plugged into this machine
+docker compose --profile hardware up
+
+# no sensor available -- replay one of Kei's recorded bags through FastLIO
+# instead (set BAG_PATH in .env to a directory with metadata.yaml + a .db3)
+docker compose --profile replay up
+```
+
+Both profiles start `perception/online_perception_node.py` subscribed to
+FastLIO's live output, publishing a `MarkerArray` to
+`/online_perception/markers` (view in RViz2) and logging each frame's
+detections. See `docker/README.md` for the full profile/service breakdown
+and `perception/README.md` for what's actually been validated running
+this way.
+
+**Known issue, not yet resolved**: this depends on ROS 2 DDS discovery
+actually working between the `fastlio`/`bag`/`perception` containers
+(`network_mode: host` should be enough, and this has worked on other
+machines) -- but it's been found completely broken on at least one dev
+machine used for this project (a bare `rclpy` publisher/subscriber pair
+failing to discover each other even within a single container, not a
+container-boundary problem). If `docker compose --profile replay up`
+produces FastLIO output (`ros2 topic hz /cloud_registered` from the host)
+but the `perception` container logs nothing, check basic ROS 2 pub/sub
+connectivity on that machine before assuming it's a code issue -- see
+`evaluation/README.md`'s "Why this runs offline, not over a live bag
+replay" section for how that was diagnosed last time. No LiDAR or Jetson
+has been reachable yet either way, so this whole path is itself only
+validated against replayed bags -- see `docker/README.md` and
+`perception/README.md` for exactly what's confirmed vs still open.
