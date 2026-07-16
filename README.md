@@ -73,6 +73,18 @@ each subdirectory's README for exactly what has and hasn't been tested.
   point-cloud gif per session. Reproduces the "2 tracks on `soton_indoor`"
   and false-positive-reduction numbers above as concrete artifacts instead
   of log excerpts. See `evaluation/README.md`.
+- **`export/`** -- ports Kei's `export_fastlio.py` (originally a manual
+  step in a three-terminal WSL2/Jazzy workflow, see
+  `kei-stuff/ros2-go2/laptop-wsl-setup.md`) into a `docker-compose`
+  service alongside this repo's own containerised Humble FastLIO, so
+  turning a new bag into `evaluation/`'s expected `pcd/` + `poses.csv`
+  layout no longer needs a second OS/ROS distro on a laptop. Verified end
+  to end: replayed the same `soton_indoor` bag used throughout
+  `perception/`'s testing through `docker compose --profile export up`,
+  fed the result straight into `evaluation/compare_pipelines.py`, and got
+  the same "2 confirmed tracks" result documented elsewhere in this
+  README from data that had never touched WSL2 or Jazzy. See
+  `export/README.md`.
 - **Multi-dog map/track merging** -- not started yet, still at the
   planning stage.
 
@@ -108,13 +120,15 @@ This only works against a session that's already been exported to PCD
 frames + a poses CSV (`data/<session>/pcd/frame_*.pcd` + `poses.csv`) --
 a handful of Kei's sessions already are, copied in from
 `kei-stuff/lidar-perception/data/`. Turning a *new* raw bag into that
-format still means Kei's original WSL2/FastLIO/`export_fastlio.py`
-workflow (`kei-stuff/ros2-go2/laptop-wsl-setup.md`,
-`kei-stuff/lidar-perception/README.md`) -- there's no Docker-based
-one-command path from bag to exported frames yet. Once real hardware is
-reachable, running the bag live through the `replay`/`hardware` Docker
-setup below and recording its own output is the more likely direction,
-rather than building a second offline exporter.
+format no longer needs Kei's original WSL2/Jazzy detour -- see `export/`
+above and its `README.md`:
+
+```bash
+cd docker
+cp .env.example .env   # same LIVOX_LIDAR_IP/LIVOX_HOST_IP as any other profile
+BAG_PATH=/path/to/bag EXPORT_OUTPUT_DIR=../data/<session> docker compose --profile export up
+# Ctrl+C once the bag service's log shows playback finished
+```
 
 ### Live (or bag-replay-standing-in-for-live): running the actual ROS node
 

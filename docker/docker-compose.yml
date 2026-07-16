@@ -29,7 +29,7 @@ services:
     network_mode: host
     command: ["fastlio"]
     restart: unless-stopped
-    profiles: ["hardware", "replay"]
+    profiles: ["hardware", "replay", "export"]
 
   # Replay profile -- stands in for the live driver when no LiDAR/Jetson is
   # reachable. Plays a recorded rosbag at (roughly) real-time rate against a
@@ -61,7 +61,7 @@ services:
     # go2-jetson-setup.md; without it the bag's first IMU/LiDAR messages can
     # arrive before FastLIO is subscribed and get silently dropped.
     command: ["bash", "-c", "sleep 5 && ros2 bag play /bag"]
-    profiles: ["replay"]
+    profiles: ["replay", "export"]
     depends_on:
       - fastlio
 
@@ -76,5 +76,33 @@ services:
       - ../perception:/opt/perception:ro
     command: ["python3", "/opt/perception/online_perception_node.py"]
     profiles: ["hardware", "replay"]
+    depends_on:
+      - fastlio
+
+  # Batch bag -> PCD/poses export -- the one-command replacement for Kei's
+  # original WSL2/Jazzy/export_fastlio.py workflow (kei-stuff/ros2-go2/
+  # laptop-wsl-setup.md), so a new bag can be turned into evaluation/'s
+  # expected data/<session>/pcd/ + poses.csv layout without a second ROS
+  # distro on a laptop. Separate profile from `replay` rather than folding
+  # into it -- exporting and running the live perception node against the
+  # same bag are different tasks that don't need to happen together, and
+  # `perception` would otherwise compete with `export` for the one bag
+  # replay's messages for no benefit to either.
+  #
+  # Needs BAG_PATH (same as the `bag` service above) and, optionally,
+  # EXPORT_OUTPUT_DIR (defaults to ../data/export if unset) and
+  # EXPORT_ACCUMULATE (defaults to 10, matching export_fastlio.py's own
+  # default). Stop with Ctrl+C (or `docker compose --profile export down`)
+  # once the `bag` service's log shows playback finished -- see
+  # ../export/README.md for why SIGTERM/SIGINT both flush cleanly.
+  export:
+    image: go2-lidar-humble:latest
+    container_name: go2-bag-export
+    network_mode: host
+    volumes:
+      - ../export:/opt/export:ro
+      - ${EXPORT_OUTPUT_DIR:-../data/export}:/output:rw
+    command: ["python3", "/opt/export/export_fastlio.py", "/output", "--accumulate", "${EXPORT_ACCUMULATE:-10}"]
+    profiles: ["export"]
     depends_on:
       - fastlio

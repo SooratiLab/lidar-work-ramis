@@ -18,14 +18,14 @@ this), see the repo's internal notes for what's still open.
 Dockerfile                        image build: Livox-SDK2 + colcon workspace
 entrypoint.sh                     renders per-dog LiDAR config, dispatches launch
 patch_livox_timestamp.py          LiDAR/IMU timestamp fix, applied at build time
-docker-compose.yml                driver + FastLIO + bag-replay + perception services
-.env.example                      copy to .env, set LIVOX_LIDAR_IP (and BAG_PATH for replay)
+docker-compose.yml                driver + FastLIO + bag-replay + perception + export services
+.env.example                      copy to .env, set LIVOX_LIDAR_IP (and BAG_PATH for replay/export)
 config/
   MID360_config.json.template     driver config with ${LIVOX_LIDAR_IP} etc.
   fastrtps_eth0_only.xml           DDS multicast whitelist (loopback + Ethernet only)
 ```
 
-`docker-compose.yml` has two profiles:
+`docker-compose.yml` has three profiles:
 
 - **`hardware`** -- `driver` + `fastlio`, for a real Mid-360 plugged into
   this Jetson.
@@ -33,6 +33,9 @@ config/
   real sensor by replaying one of Kei's recorded bags against a live
   FastLIO instance instead. See `../perception/README.md` for what that's
   actually validated so far.
+- **`export`** -- `fastlio` + `bag` + `export`, for turning a bag into the
+  `pcd/` + `poses.csv` layout `../evaluation/` expects, without a live
+  ROS graph to watch or a separate node to run. See `../export/README.md`.
 
 Every service needs a profile flag -- there is no profile-less default
 service in this file, so a bare `docker compose build`/`up` matches nothing
@@ -79,6 +82,21 @@ docker compose --profile replay up
 This runs FastLIO against a replayed bag instead of a live driver, plus the
 online perception node from `../perception/`. See `../perception/README.md`
 for what this has actually produced against real recorded data.
+
+The same `BAG_PATH` also works with the `export` profile, which swaps the
+live perception node for a one-shot batch export to PCD files + a poses
+CSV instead:
+
+```bash
+BAG_PATH=/path/to/bag EXPORT_OUTPUT_DIR=/path/to/write/into docker compose --profile export up
+```
+
+`EXPORT_OUTPUT_DIR` defaults to `../data/export` if unset; `EXPORT_ACCUMULATE`
+(default 10, matching `export_fastlio.py`'s own default) controls how many
+scans get merged into each output frame. Stop with Ctrl+C once the `bag`
+service's log shows playback finished -- see `../export/README.md` for
+what this produces and why SIGTERM/SIGINT both flush cleanly instead of
+losing whatever's still in the accumulation buffer.
 
 ## What's already fixed vs what's still open
 
