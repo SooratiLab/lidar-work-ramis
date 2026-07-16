@@ -85,8 +85,22 @@ each subdirectory's README for exactly what has and hasn't been tested.
   the same "2 confirmed tracks" result documented elsewhere in this
   README from data that had never touched WSL2 or Jazzy. See
   `export/README.md`.
-- **Multi-dog map/track merging** -- not started yet, still at the
-  planning stage.
+- **`merge/`** -- fuses two dogs' independently-tracked objects into one
+  shared-frame track log, instead of merging raw point clouds (which
+  Kei's handover already found unreliable on real two-dog field data --
+  see `merge/README.md` for why). Calibrates a supplied relative-pose
+  prior against whichever tracks the two dogs actually agree on (a
+  track-level analogue of ICP-with-prior), searches for a frame-index
+  lag between the two dogs' independently-exported sessions, and fuses
+  corresponded tracks while keeping single-dog-only tracks rather than
+  dropping them. Validated against the one two-dog session currently
+  exported (`2026-05-12_fallback_cardbox1`, the cardboard-box
+  complementary-coverage demo from Kei's handover): recovers a plausible
+  calibration from an identity prior and produces one continuous fused
+  trajectory for the object both dogs actually saw, alongside several
+  correctly-uncorresponded single-dog tracks. See `merge/README.md` for
+  the full result and honest caveats -- one validated session is a real
+  result, not a systematic one.
 
 ## Usage
 
