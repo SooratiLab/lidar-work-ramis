@@ -67,5 +67,11 @@ each subdirectory's README for exactly what has and hasn't been tested.
   for the full writeup, including what's confirmed vs still open -- most
   notably, this is all validated against recorded bags standing in for a
   live sensor, not an actual moving dog yet.
+- **`evaluation/`** -- compares the current tracking pipeline against
+  Kei's offline `track_motion.py` output on the same recorded sessions,
+  producing trajectory/speed/track-count plots and a frame-by-frame
+  point-cloud gif per session. Reproduces the "2 tracks on `soton_indoor`"
+  and false-positive-reduction numbers above as concrete artifacts instead
+  of log excerpts. See `evaluation/README.md`.
 - **Multi-dog map/track merging** -- not started yet, still at the
   planning stage.
