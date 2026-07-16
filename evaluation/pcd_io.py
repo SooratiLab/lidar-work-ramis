@@ -1,7 +1,7 @@
 """
 pcd_io.py -- minimal binary PCD reader for evaluation/.
 
-Handles exactly the format kei-stuff/lidar-perception/scripts/export_fastlio.py
+Handles exactly the format kei-stuff/ros2-go2/scripts/export_fastlio.py
 writes (FIELDS x y z intensity, TYPE F F F F, DATA binary) -- this is a
 narrow reader for that one format, not a general PCD parser. Written
 separately from perception/pointcloud.py's PointCloud2 parser because a PCD

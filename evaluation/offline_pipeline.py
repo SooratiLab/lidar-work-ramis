@@ -2,7 +2,7 @@
 offline_pipeline.py -- run perception/tracking.py's tracker directly against
 an already-exported PCD + poses session, instead of over a live ROS graph.
 
-kei-stuff/lidar-perception/scripts/export_fastlio.py replays a bag through
+kei-stuff/ros2-go2/scripts/export_fastlio.py replays a bag through
 FastLIO and writes each accumulate-N window as a PCD frame (millimetres,
 matching the rest of that pipeline's PCD convention) plus a poses.csv of
 per-scan FastLIO odometry (metres, matching ROS convention) -- see that
