@@ -33,19 +33,22 @@ chasing further against a dev machine that was never the deployment target
 question of its own.
 
 **Update**: re-checked this while building `export/`, since that needed
-the same cross-container DDS path to test against real data. DDS
-discovery works on this machine now -- a bare `ros2 topic pub`/`hz` pair
-discovers fine, and a full `docker compose --profile export up` run
-(`fastlio`, `bag`, and a third container all talking to each other) also
-worked end to end with no discovery issues. Neither test controlled for
-what changed since the finding above, so this isn't a root-cause
-explanation -- but the live `replay` profile and a fresh live-bag-replay
-run of this comparison are both worth actually retrying rather than
-continuing to assume they're blocked here. Not retried yet as part of
-this change; the rest of this section's reasoning for why the offline
-replay is arguably the *better* comparison regardless (identical input to
-both pipelines, no double-FastLIO-registration variance) still holds
-either way.
+the same cross-container DDS path to test against real data, and then
+again directly: re-ran `docker compose --profile replay up` against
+`soton_indoor` end to end. DDS discovery works on this machine now -- the
+`perception` container logged live detections frame by frame, reporting
+the same two tracks and walking-pace speeds this file's own offline
+comparison reports below for the same session. Neither this nor the
+original "broken" finding controlled for what changed in between (machine
+state, Docker version, network config are all plausible, none confirmed),
+so this doesn't explain *why* it started working -- but it is now a
+directly confirmed result, not a "worth retrying" guess. This doesn't
+retroactively invalidate anything below: the offline replay this file
+actually uses is still arguably the *better* comparison regardless
+(identical input to both pipelines being compared, no double-FastLIO-
+registration variance a fresh live replay would introduce), so this
+module's approach is unchanged -- the point of re-checking was just to
+stop citing a stale "doesn't work here" reason for that choice.
 
 Instead, this replays `perception/tracking.py`'s actual clustering/tracking
 code (no `rclpy` dependency -- see that module's own docstring) directly

@@ -155,18 +155,27 @@ detections. See `docker/README.md` for the full profile/service breakdown
 and `perception/README.md` for what's actually been validated running
 this way.
 
-**Known issue, not yet resolved**: this depends on ROS 2 DDS discovery
-actually working between the `fastlio`/`bag`/`perception` containers
-(`network_mode: host` should be enough, and this has worked on other
-machines) -- but it's been found completely broken on at least one dev
-machine used for this project (a bare `rclpy` publisher/subscriber pair
-failing to discover each other even within a single container, not a
-container-boundary problem). If `docker compose --profile replay up`
-produces FastLIO output (`ros2 topic hz /cloud_registered` from the host)
-but the `perception` container logs nothing, check basic ROS 2 pub/sub
-connectivity on that machine before assuming it's a code issue -- see
-`evaluation/README.md`'s "Why this runs offline, not over a live bag
-replay" section for how that was diagnosed last time. No LiDAR or Jetson
-has been reachable yet either way, so this whole path is itself only
-validated against replayed bags -- see `docker/README.md` and
-`perception/README.md` for exactly what's confirmed vs still open.
+**Known issue, previously blocking, now confirmed resolved on at least
+this machine**: this depends on ROS 2 DDS discovery actually working
+between the `fastlio`/`bag`/`perception` containers (`network_mode: host`
+should be enough, and this has worked on other machines) -- earlier
+testing found it completely broken on this dev machine (a bare `rclpy`
+publisher/subscriber pair failing to discover each other even within a
+single container). Re-checked and actually re-ran `docker compose
+--profile replay up` against `soton_indoor` end to end: the `perception`
+container now logs live detections frame by frame, matching the same two
+tracks and speeds `evaluation/`'s offline replay of the same session
+reports (see `evaluation/README.md`). Neither this nor the earlier
+"broken" finding controlled for what changed in between (machine state,
+Docker version, network config are all plausible, none confirmed), so
+this is a live re-test, not a root-cause explanation -- but the `replay`
+profile with `perception` subscribed live is confirmed working *now*, on
+this machine, not just "worth retrying." If `docker compose --profile
+replay up` produces FastLIO output (`ros2 topic hz /cloud_registered`
+from the host) but the `perception` container logs nothing on some other
+machine, that's a sign this is machine/environment-dependent, not
+necessarily a code issue -- see `evaluation/README.md`'s "Why this runs
+offline, not over a live bag replay" section for the full history. No
+LiDAR or Jetson has been reachable yet either way, so this whole path is
+itself only validated against replayed bags -- see `docker/README.md`
+and `perception/README.md` for exactly what's confirmed vs still open.

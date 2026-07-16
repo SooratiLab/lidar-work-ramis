@@ -141,3 +141,14 @@ Jetson build, and whether CycloneDDS's node-creation segfault (which forced
 FastRTPS on the Foxy setup this replaces) still happens on Humble. FastRTPS
 is kept as the default RMW here because it's the combination proven to
 work, not because CycloneDDS is assumed still broken.
+
+Whether this container can run *live*, right now, on a Jetson that hasn't
+been reflashed yet (still JetPack 5.1.x/Ubuntu 20.04/Foxy) rather than
+waiting for the JetPack 6 reflash is a separate, related question with its
+own reasoning and open items -- see the repo's internal notes' "Can the
+Humble container actually run live on a Jetson without reflashing?"
+section (short answer: architecturally yes, this is exactly why it's a
+container and not a patch script, but three concrete things -- Docker
+actually present on the Jetson, an aarch64 build, and the segfault
+question re-tested from inside a container -- are still unconfirmed
+either way).
