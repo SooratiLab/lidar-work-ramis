@@ -71,6 +71,188 @@ docker compose --profile hardware up fastlio    # FastLIO only (needs the driver
 docker compose --profile hardware run --rm driver bash   # shell inside the built image
 ```
 
+## First live run on a Go2 Jetson
+
+This is the lowest-friction route from a freshly accessible Jetson to a
+useful live test. Do one dog at a time first. The two known Mid-360 addresses
+are `192.168.1.137` for Dog 1 and `192.168.1.120` for Dog 2; the address belongs
+to the physical LiDAR, so use the other value if the sensors have been swapped.
+
+### 1. Preflight the host and network
+
+Keep the robot supported or standing still for the first test, connect the
+Mid-360 to the rear XT30 Ethernet port, and SSH to the Jetson over WiFi or
+Tailscale. Run the deployment inside `tmux` so losing SSH does not stop it.
+
+```bash
+tmux new -s lidar-live
+
+# Record exactly what platform is under test. JetPack 6 should report Ubuntu
+# 22.04; the container remains the same if a Jetson is still on JetPack 5.
+uname -m                         # expect aarch64
+cat /etc/os-release
+cat /etc/nv_tegra_release
+docker version
+docker compose version
+df -h /var/lib/docker .         # leave ample room for the multi-GB build
+
+# eth0 must carry both the Go2 and LiDAR subnets, with no eth0 default route.
+ip -br addr show eth0
+ip route
+ping -c 3 192.168.1.137         # Dog 2: 192.168.1.120
+```
+
+Expected on `eth0`: `192.168.123.18/24` and `192.168.1.50/24`. There should
+not be a `default via 192.168.123.1` route. If either is wrong, fix the Jetson
+netplan using `kei-stuff/ros2-go2/go2-jetson-setup.md` sections 4 and 7 before
+debugging Docker. A failed LiDAR ping is likewise a cable/address/network
+problem, not a perception problem.
+
+The image does not use CUDA, so `nvidia-container-runtime` is not required for
+this test. Docker Engine plus the Compose plugin is sufficient.
+
+### 2. Copy the code and build once on the Jetson
+
+Clone or pull this repository on the Jetson, then configure the physical
+sensor. Do not copy another dog's `.env` without checking the address.
+
+```bash
+cd ~/go2-stuff/lidar-work-ramis/docker
+cp .env.example .env
+nano .env                       # set LIVOX_LIDAR_IP; host IP is normally unchanged
+
+# Build can be slow on the Jetson. Keep it in tmux and do not start a field
+# session until this has completed successfully.
+docker compose --profile hardware build
+```
+
+The Dockerfile is intentionally multi-architecture: on the Jetson it pulls
+the arm64 ROS image and compiles arm64 dependencies locally. A failure while
+cloning or running `rosdep` usually means the Jetson lost its internet route;
+check `ip route` and WiFi before changing the Dockerfile.
+
+Before involving hardware, a short recorded-bag replay is the best smoke test
+if a bag is already present on the Jetson:
+
+```bash
+# Add BAG_PATH=/absolute/path/to/bag to .env, then:
+docker compose --profile replay up
+```
+
+That separates image/DDS/perception failures from live Livox networking. Stop
+it with Ctrl+C after `go2-online-perception` has logged several processed
+frames.
+
+### 3. Start the live stack and verify it from the bottom up
+
+```bash
+docker compose --profile hardware up -d
+docker compose --profile hardware ps
+docker compose --profile hardware logs -f
+```
+
+In a second SSH/tmux window, check every boundary in order. Each command is
+run inside the already-configured FastLIO container, avoiding a second host
+ROS installation or mismatched DDS environment.
+
+```bash
+# Raw sensor: both must publish. LiDAR should normally be about 10 Hz.
+docker exec go2-fastlio timeout 15 ros2 topic hz /livox/lidar
+docker exec go2-fastlio timeout 15 ros2 topic hz /livox/imu
+
+# FastLIO: both should settle near 9-10 Hz.
+docker exec go2-fastlio timeout 15 ros2 topic hz /cloud_registered
+docker exec go2-fastlio timeout 15 ros2 topic hz /Odometry
+
+# Perception output. It needs two accumulated frames before it can compare
+# motion, so allow roughly 2-3 seconds with the default 10-scan windows.
+docker logs --since 2m go2-online-perception
+```
+
+Success means all four topics publish continuously and perception logs lines
+of the form `frame ... processed in ...ms`. Confirmed tracks appear as
+`track N [new|matched|coasting|reidentified]`. No tracks in an empty, static
+scene is healthy; frame processing is the liveness check. Walk a person across
+the LiDAR view before moving the dog, then repeat while walking the dog slowly.
+This distinguishes basic detection from the harder moving-viewpoint case.
+
+Keep an eye on `/livox/lidar` during a field run, not only at startup. One
+existing outdoor bag contains IMU for 29 minutes but LiDAR for only its first
+186 seconds; a periodic rate check would have caught that live.
+
+### 4. Run a repeatable benchmark
+
+Leave the hardware profile running, allow 60 seconds for FastLIO and thermal
+state to settle, then exercise a representative route during a five-minute
+capture:
+
+```bash
+python3 benchmark_live.py --duration 300 --output benchmark-dog1-moving
+```
+
+The collector uses only the Python standard library. It writes:
+
+- `summary.json`: perception frame count, mean/p50/p95/p99/max processing
+  time, real-time budget use, and warning count;
+- `topic-hz-*.txt`: raw input and FastLIO output rates;
+- `docker-stats.csv`: per-container CPU and memory once per second;
+- `tegrastats.txt`: Jetson clocks, temperatures, RAM, and power telemetry
+  when the host provides `tegrastats`;
+- `perception.log`, platform/version files, and the exact container state.
+
+Use separate directories for at least three runs: stationary empty scene,
+stationary with a walker, and dog moving with a walker. Run the same route and
+duration when comparing settings. Five minutes is long enough to expose heat
+or clock throttling that a quick indoor smoke test can miss.
+
+For reproducible maximum-performance numbers, record the current power mode
+with `sudo nvpmodel -q`; optionally select the lab-approved maximum-power mode
+and run `sudo jetson_clocks` before all comparison runs. These commands alter
+power/thermal behaviour, so do not mix boosted and default-mode results or use
+them without considering battery and cooling. The benchmark records the mode
+and tegrastats output so the result remains interpretable.
+
+A practical pass criterion is:
+
+- raw LiDAR, `/cloud_registered`, and `/Odometry` remain close to 10 Hz with
+  no long gaps;
+- the benchmark contains the expected number of perception frames (roughly
+  one per second with the default `accumulate_scans=10`);
+- p95 processing time stays comfortably below its roughly one-second frame
+  budget (under 50% is the node's built-in warning boundary; under 20% leaves
+  much healthier margin for load spikes);
+- memory does not trend upward throughout the run, and tegrastats shows no
+  sustained thermal throttling;
+- the moving run produces plausible, persistent tracks rather than a flood of
+  one-frame IDs or positions tens of metres from the robot.
+
+### 5. Stop cleanly
+
+```bash
+docker compose --profile hardware down
+```
+
+`restart: unless-stopped` is useful after a process crash, but also means the
+stack can return after a Jetson reboot. Use `down` when the experiment is over
+rather than only killing individual processes.
+
+### Live troubleshooting by symptom
+
+| Symptom | Most likely cause | Check/fix |
+|---|---|---|
+| Driver logs `bind failed` | `192.168.1.50/24` missing from `eth0` | Fix netplan; host networking cannot compensate for a missing host address |
+| Driver runs but `/livox/lidar` is silent | Wrong physical LiDAR IP, rear cable/power, or timestamp/config problem | Ping the `.env` address; inspect `docker logs go2-lidar-driver`; confirm the rendered-IP line |
+| Raw topics publish but FastLIO topics do not | LiDAR/IMU timestamps or FastLIO startup | Confirm both raw rates, restart the whole profile, and check FastLIO for sync warnings; the image already applies the known timestamp patch |
+| FastLIO publishes but perception has no frames | DDS discovery or perception crash | `docker compose ... ps`, then `docker logs go2-online-perception`; all services must use host networking |
+| Frames process but no tracks appear | Static scene, insufficient points, or live density differs from replay data | First cross the view at walking pace; inspect moved/cluster counts before tuning parameters |
+| Topic rate degrades after minutes | LiDAR link/driver dropout or Jetson throttling | Compare topic-hz output with `tegrastats.txt`; check cable/power and temperatures |
+| `benchmark_live.py` reports no frames | Pipeline was not live during the timed window | Read `perception.log` and the four topic-hz files; fix the lowest silent topic first |
+
+Do not tune detection thresholds until the raw and FastLIO rates are stable.
+If tuning is needed, change one ROS parameter at a time and keep a benchmark
+directory for the baseline and each variant; otherwise hardware, route, and
+algorithm changes become impossible to separate.
+
 No sensor to test against? `.env` also takes a `BAG_PATH` (a directory with
 `metadata.yaml` + a `.db3` file, e.g. one of Kei's recordings under
 `kei-stuff/ros2-go2/bag/`) for the `replay` profile:
