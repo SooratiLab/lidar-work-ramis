@@ -78,11 +78,145 @@ useful live test. Do one dog at a time first. The two known Mid-360 addresses
 are `192.168.1.137` for Dog 1 and `192.168.1.120` for Dog 2; the address belongs
 to the physical LiDAR, so use the other value if the sensors have been swapped.
 
-### 1. Preflight the host and network
+### Before going to the lab
+
+Bring the laptop and its charger, a charged Go2 battery, the Go2 charger,
+Ethernet cable and any USB-to-Ethernet adapter the laptop needs. Keep the
+controller beside the operator and know how to stop or damp the robot before
+asking anyone to walk through the sensor view. The software below only reads
+LiDAR and odometry; it does not send motion commands, but the normal robot
+safety procedure still applies.
+
+The Go2 has one Ethernet path serving two different jobs at different times:
+
+1. **Initial access:** laptop Ethernet is connected to the Go2 so the laptop
+   can SSH directly to the Jetson at `192.168.123.18`.
+2. **Live LiDAR:** that laptop cable is removed and the Mid-360 is connected
+   to the Go2 Ethernet port, with power from the **rear** XT30 port. From this
+   point, SSH must use WiFi, Tailscale, or the `go2-field` access point.
+
+Do not expect to keep the direct laptop SSH link while the LiDAR occupies the
+port. Before swapping the cable, prove that one of the wireless SSH routes
+works. Direct Ethernet also does not give the Jetson internet access; GitHub
+fetches require working WiFi (or another separately configured internet
+route).
+
+### 1. Connect the laptop directly and SSH to the Jetson
+
+Power on one dog and wait for the Jetson to boot. Connect the laptop's
+Ethernet adapter to the Go2 Ethernet port. Set **only that laptop adapter** to
+the following manual IPv4 settings:
+
+- address: `192.168.123.99`
+- prefix/subnet mask: `/24` or `255.255.255.0`
+- gateway: blank
+- DNS: blank
+
+On Windows this is **Settings -> Network & internet -> Ethernet -> IP
+assignment -> Edit -> Manual -> IPv4**. On Ubuntu with NetworkManager, first
+find the wired connection name with `nmcli connection show`, then use:
+
+```bash
+sudo nmcli connection modify "<wired-connection-name>" \
+  ipv4.method manual ipv4.addresses 192.168.123.99/24 \
+  ipv4.gateway "" ipv4.dns "" ipv4.never-default yes
+sudo nmcli connection up "<wired-connection-name>"
+```
+
+Leaving the gateway blank is deliberate: it prevents the laptop from trying
+to send internet traffic into the robot network. Verify the link from a
+laptop terminal:
+
+```bash
+ping -c 3 192.168.123.18                 # Linux/macOS
+# Windows PowerShell: ping 192.168.123.18
+ssh unitree@192.168.123.18
+```
+
+Both dogs use `192.168.123.18`, so connect only one at a time. On the first
+SSH connection, check the displayed fingerprint with the lab's existing
+record before accepting it; a changed fingerprint after a reflash can be
+legitimate, but should not be accepted blindly. Obtain the current password
+from the lab owner -- credentials are intentionally not stored in this repo.
+If an old reflash key causes `REMOTE HOST IDENTIFICATION HAS CHANGED`, remove
+only this host's stale key after confirming the reflash:
+
+```bash
+ssh-keygen -R 192.168.123.18
+```
+
+If ping fails, do not change ROS or Docker. Check that the dog has finished
+booting, the Ethernet adapter shows link, the laptop address really is
+`192.168.123.99/24`, VPN software is not capturing the route, and no second
+dog with the same address is connected.
+
+### 2. Establish the wireless SSH and internet path
+
+While still connected over direct Ethernet, inspect rather than guess which
+wireless connection is available:
+
+```bash
+ip -br link
+ip -br addr
+nmcli device status
+ip route
+ping -c 3 8.8.8.8
+getent hosts github.com
+```
+
+The direct cable proves local access; the final two commands prove that the
+Jetson can actually fetch GitHub code. If internet works, note a wireless SSH
+address. Depending on the lab setup this is the Jetson's Tailscale IP, or
+`192.168.50.10` for Dog 1 / `192.168.50.11` for Dog 2 on the `go2-field`
+access point. The latter provides field SSH but normally **not** internet.
+
+From a second laptop terminal, test the wireless route while the direct SSH
+session remains open:
+
+```bash
+ssh unitree@<wireless-or-tailscale-ip>
+```
+
+Only continue when that succeeds. If the Jetson was reflashed and WiFi or
+Tailscale is not configured, stop here and complete the networking setup in
+the legacy
+[Go2 Jetson setup runbook](https://github.com/SooratiLab/ros2-go2/blob/main/go2-jetson-setup.md);
+otherwise swapping in the LiDAR cable will lock the laptop out.
+
+### 3. Fetch the GitHub code and pin what will be tested
+
+The repository is public, so HTTPS is the simplest read-only deployment path
+and does not require putting a GitHub SSH key on the robot. Run these commands
+on the **Jetson**, not on the laptop:
+
+```bash
+cd ~
+git clone https://github.com/SooratiLab/lidar-work-ramis.git
+cd ~/lidar-work-ramis
+git switch main
+git pull --ff-only origin main
+git status --short
+git rev-parse HEAD
+```
+
+For an existing checkout, skip `clone` and run the final five commands. A
+successful preflight has no output from `git status --short`; if it lists
+files, preserve and review those local changes instead of overwriting them.
+`--ff-only` refuses an ambiguous merge, which is safer on a deployment copy.
+Save the printed commit hash in the experiment notes. Fetching `main` makes
+the run repeatable only when that hash is recorded.
+
+If the repository is private by test day, use a lab-approved deploy key or
+personal access method; do not paste a token into a clone URL or shell
+history. If `git clone` cannot resolve or reach GitHub, fix the Jetson's WiFi,
+DNS, and default route before touching the code.
+
+### 4. Preflight the host and robot network
 
 Keep the robot supported or standing still for the first test, connect the
-Mid-360 to the rear XT30 Ethernet port, and SSH to the Jetson over WiFi or
-Tailscale. Run the deployment inside `tmux` so losing SSH does not stop it.
+Mid-360 data lead to the Go2 Ethernet port, power it from the rear XT30 port,
+and reconnect to the Jetson using the wireless SSH route already tested.
+Run the deployment inside `tmux` so losing SSH does not stop it.
 
 ```bash
 tmux new -s lidar-live
@@ -104,26 +238,36 @@ ping -c 3 192.168.1.137         # Dog 2: 192.168.1.120
 
 Expected on `eth0`: `192.168.123.18/24` and `192.168.1.50/24`. There should
 not be a `default via 192.168.123.1` route. If either is wrong, fix the Jetson
-netplan using `kei-stuff/ros2-go2/go2-jetson-setup.md` sections 4 and 7 before
-debugging Docker. A failed LiDAR ping is likewise a cable/address/network
-problem, not a perception problem.
+netplan using sections 4 and 7 of the
+[Go2 Jetson setup runbook](https://github.com/SooratiLab/ros2-go2/blob/main/go2-jetson-setup.md)
+before debugging Docker. A failed LiDAR ping is likewise a
+cable/address/network problem, not a perception problem.
 
-The image does not use CUDA, so `nvidia-container-runtime` is not required for
-this test. Docker Engine plus the Compose plugin is sufficient.
+Also confirm the system clock is credible with `date --iso-8601=seconds`;
+incorrect clocks make logs and comparisons hard to reconcile. The image does
+not use CUDA, so `nvidia-container-runtime` is not required for this test.
+Docker Engine plus the Compose plugin is sufficient.
 
-### 2. Copy the code and build once on the Jetson
+### 5. Configure and build once on the Jetson
 
-Clone or pull this repository on the Jetson, then configure the physical
-sensor. Do not copy another dog's `.env` without checking the address.
+Configure the physical sensor. Do not copy another dog's `.env` without
+checking the address.
 
 ```bash
-cd ~/go2-stuff/lidar-work-ramis/docker
+cd ~/lidar-work-ramis/docker
 cp .env.example .env
 nano .env                       # set LIVOX_LIDAR_IP; host IP is normally unchanged
 
 # Build can be slow on the Jetson. Keep it in tmux and do not start a field
 # session until this has completed successfully.
 docker compose --profile hardware build
+```
+
+Before starting containers, make Compose show the resolved configuration and
+check that the selected LiDAR address is exactly the intended physical unit:
+
+```bash
+docker compose --profile hardware config
 ```
 
 The Dockerfile is intentionally multi-architecture: on the Jetson it pulls
@@ -143,7 +287,7 @@ That separates image/DDS/perception failures from live Livox networking. Stop
 it with Ctrl+C after `go2-online-perception` has logged several processed
 frames.
 
-### 3. Start the live stack and verify it from the bottom up
+### 6. Start the live stack and verify it from the bottom up
 
 ```bash
 docker compose --profile hardware up -d
@@ -180,7 +324,7 @@ Keep an eye on `/livox/lidar` during a field run, not only at startup. One
 existing outdoor bag contains IMU for 29 minutes but LiDAR for only its first
 186 seconds; a periodic rate check would have caught that live.
 
-### 4. Run a repeatable benchmark
+### 7. Run a repeatable benchmark
 
 Leave the hardware profile running, allow 60 seconds for FastLIO and thermal
 state to settle, then exercise a representative route during a five-minute
@@ -205,6 +349,13 @@ stationary with a walker, and dog moving with a walker. Run the same route and
 duration when comparing settings. Five minutes is long enough to expose heat
 or clock throttling that a quick indoor smoke test can miss.
 
+Use names that cannot be confused later, for example
+`benchmark-20260721-dog1-stationary-empty`,
+`benchmark-20260721-dog1-stationary-walker`, and
+`benchmark-20260721-dog1-moving-walker`. The output directory must not already
+exist. During the first two runs leave the dog stationary; for the moving run,
+use the controller normally and have a second person walk the agreed route.
+
 For reproducible maximum-performance numbers, record the current power mode
 with `sudo nvpmodel -q`; optionally select the lab-approved maximum-power mode
 and run `sudo jetson_clocks` before all comparison runs. These commands alter
@@ -226,10 +377,18 @@ A practical pass criterion is:
 - the moving run produces plausible, persistent tracks rather than a flood of
   one-frame IDs or positions tens of metres from the robot.
 
-### 5. Stop cleanly
+### 8. Stop cleanly and copy the evidence off the dog
 
 ```bash
 docker compose --profile hardware down
+```
+
+Confirm `docker compose --profile hardware ps` shows no remaining project
+containers. Copy benchmark directories to the laptop before leaving the lab;
+run this on the laptop while a working SSH route is available:
+
+```bash
+scp -r unitree@<jetson-ip>:~/lidar-work-ramis/docker/benchmark-20260721-dog1-* .
 ```
 
 `restart: unless-stopped` is useful after a process crash, but also means the
@@ -252,6 +411,21 @@ Do not tune detection thresholds until the raw and FastLIO rates are stable.
 If tuning is needed, change one ROS parameter at a time and keep a benchmark
 directory for the baseline and each variant; otherwise hardware, route, and
 algorithm changes become impossible to separate.
+
+### First-session go/no-go checklist
+
+Do not begin the moving benchmark until every earlier gate is true:
+
+- [ ] Only one dog is on the direct `192.168.123.18` Ethernet path.
+- [ ] Direct SSH worked, then wireless/Tailscale SSH worked before the cable swap.
+- [ ] The Jetson can resolve and reach GitHub, and the tested commit hash is recorded.
+- [ ] `eth0` has both expected addresses and no default route.
+- [ ] The physical LiDAR IP matches `.env` and responds to ping.
+- [ ] Compose built successfully and all three hardware containers are running.
+- [ ] Raw LiDAR and IMU publish; FastLIO cloud and odometry publish continuously.
+- [ ] Perception logs processed frames in a stationary test.
+- [ ] The controller, operator, clear test area, battery, disk space, and cooling are ready.
+- [ ] A short stationary-with-walker run produces plausible output before the dog moves.
 
 No sensor to test against? `.env` also takes a `BAG_PATH` (a directory with
 `metadata.yaml` + a `.db3` file, e.g. one of Kei's recordings under
