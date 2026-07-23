@@ -47,6 +47,13 @@ Publishes:
                                    Tentative tracks (fewer than min_hits
                                    real detections so far) are not
                                    published at all -- see min_hits below.
+    /online_perception/tracks     (geometry_msgs/PoseArray) -- confirmed
+                                   detections backed by a measurement in
+                                   the current frame, including an empty
+                                   array when no track is observed. Unlike
+                                   the RViz markers, coasted predictions
+                                   are excluded so control consumers do
+                                   not react to stale evidence.
 
 Parameters (all overridable via --ros-args -p <name>:=<value>):
     accumulate_scans     (int,   default 10)    scans merged per frame --
@@ -307,10 +314,11 @@ from pathlib import Path
 
 import numpy as np
 import rclpy
+from geometry_msgs.msg import Pose, PoseArray
+from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from scipy.spatial import cKDTree
 from sensor_msgs.msg import PointCloud2
-from nav_msgs.msg import Odometry
 from visualization_msgs.msg import Marker, MarkerArray
 
 # Local, non-ROS modules living alongside this script -- see pointcloud.py,
@@ -419,6 +427,8 @@ class OnlinePerceptionNode(Node):
             Odometry, "/Odometry", self._odom_cb, 10)
         self._marker_pub = self.create_publisher(
             MarkerArray, "/online_perception/markers", 10)
+        self._tracks_pub = self.create_publisher(
+            PoseArray, "/online_perception/tracks", 10)
 
         self.get_logger().info(
             f"online_perception_node ready -- accumulating "
@@ -620,6 +630,9 @@ class OnlinePerceptionNode(Node):
         active_tracks = self._tracker.step(clusters, dt)
 
         markers = MarkerArray()
+        tracks = PoseArray()
+        tracks.header.frame_id = self._frame_id
+        tracks.header.stamp = self.get_clock().now().to_msg()
         for track_id, info in active_tracks.items():
             # Tentative tracks (fewer than min_hits real detections) are
             # tracked internally so they have a chance to become confirmed,
@@ -645,9 +658,24 @@ class OnlinePerceptionNode(Node):
                 f"{speed:.2f} m/s")
             markers.markers.extend(
                 self._build_markers(track_id, track, speed, info["is_coasting"], info["is_reidentified"]))
+            # PoseArray is intentionally limited to detections backed by a
+            # measurement in this frame. A coasted Kalman prediction is
+            # useful for visual continuity, but should not trigger a robot
+            # response without a current observation.
+            if not info["is_coasting"]:
+                pose = Pose()
+                pose.position.x = float(track.position[0])
+                pose.position.y = float(track.position[1])
+                pose.position.z = float(track.position[2])
+                pose.orientation.w = 1.0
+                tracks.poses.append(pose)
 
         if markers.markers:
             self._marker_pub.publish(markers)
+        # Publish empty arrays too: consumers need an explicit "clear"
+        # observation rather than having to guess whether silence means no
+        # tracks or a dead perception node.
+        self._tracks_pub.publish(tracks)
 
     def _build_markers(self, track_id, track, speed, is_coasting, is_reidentified):
         colour = _track_colour(track_id)

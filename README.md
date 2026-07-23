@@ -163,11 +163,13 @@ docker compose --profile replay up
 ```
 
 Both profiles start `perception/online_perception_node.py` subscribed to
-FastLIO's live output, publishing a `MarkerArray` to
-`/online_perception/markers` (view in RViz2) and logging each frame's
-detections. See `docker/README.md` for the full profile/service breakdown
-and `perception/README.md` for what's actually been validated running
-this way.
+FastLIO's live output. It publishes RViz markers and machine-readable
+confirmed tracks; a separate response node turns repeated tracks within
+2 m into `/online_perception/stop_requested`. This is currently a safe
+response boundary, not a movement command: no node forwards the request to
+Unitree's Sport API until the complete path has been checked on stationary
+hardware. See `docker/README.md` for the profile/service breakdown and
+`perception/README.md` for topic details and validation status.
 
 **Known issue, previously blocking, now confirmed resolved on at least
 this machine**: this depends on ROS 2 DDS discovery actually working

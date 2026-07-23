@@ -10,7 +10,8 @@ changed and why.
 ## Layout
 
 - `online_perception_node.py` -- the ROS 2 node: subscribes to FastLIO's
-  topics, accumulates scans into frames, publishes RViz markers. The only
+  topics, accumulates scans into frames, publishes confirmed tracks and
+  RViz markers. The only
   non-ROS logic left in it is a trivial colour-picker for track markers,
   not worth splitting out for its own tests.
 - `pointcloud.py` -- PointCloud2 parsing and voxel downsampling. Plain
@@ -23,8 +24,37 @@ changed and why.
   suppresses "moved" points a moving sensor's own viewpoint change
   produced, rather than something actually moving -- see "Visibility gate"
   below. Plain numpy, no rclpy dependency.
-- `tests/` -- unit tests for `pointcloud.py`, `tracking.py`, and
-  `range_image.py` (see "Testing" below).
+- `cluster_response_node.py` / `response_policy.py` -- convert confirmed,
+  current tracks into a debounced stop request. The ROS node publishes the
+  request; the plain-numpy policy holds the thresholds and hysteresis.
+- `tests/` -- unit tests for the plain Python perception and response
+  modules (see "Testing" below).
+
+## Output and basic response
+
+`online_perception_node.py` publishes two views of each confirmed track:
+
+- `/online_perception/markers` (`visualization_msgs/MarkerArray`) for RViz.
+- `/online_perception/tracks` (`geometry_msgs/PoseArray`) as the
+  machine-readable control boundary. It is published every processed
+  frame, including an empty array when nothing is detected. Coasted
+  predictions are excluded: a predicted position with no current
+  measurement is useful for display and identity continuity, but is not
+  strong enough evidence to trigger a robot response.
+
+`cluster_response_node.py` measures those track positions from the current
+FastLIO `/Odometry` position. Two consecutive frames with a track within
+`stop_distance` (2.0 m by default) request a stop; two frames with no track
+inside `clear_distance` (2.5 m) clear it. The separate clear threshold
+prevents a noisy centroid near 2 m repeatedly toggling the result. Output is
+`std_msgs/Bool` on `/online_perception/stop_requested`.
+
+This is deliberately a request, not direct actuation. The replay and
+hardware Compose profiles run the response node, but nothing yet forwards
+the Bool to Unitree's `/api/sport/request`. Add that adapter only after
+CycloneDDS discovery, live detections, and stop-request behaviour have each
+been observed on a stationary Go2; the adapter should default disabled and
+use Unitree's `StopMove` API only.
 
 ## Why this exists
 

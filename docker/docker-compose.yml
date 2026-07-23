@@ -88,6 +88,22 @@ services:
     depends_on:
       - fastlio
 
+  # Conservative first response layer. It converts confirmed, current
+  # perception tracks into a debounced Bool stop request; it deliberately
+  # has no connection to /api/sport/request yet, so replay and initial
+  # hardware validation cannot accidentally command the robot.
+  response:
+    image: go2-lidar-humble:latest
+    container_name: go2-cluster-response
+    network_mode: host
+    environment: *dds-environment
+    volumes:
+      - ../perception:/opt/perception:ro
+    command: ["python3", "/opt/perception/cluster_response_node.py"]
+    profiles: ["hardware", "replay"]
+    depends_on:
+      - perception
+
   # Batch bag -> PCD/poses export -- the one-command replacement for Kei's
   # original WSL2/Jazzy/export_fastlio.py workflow (kei-stuff/ros2-go2/
   # laptop-wsl-setup.md), so a new bag can be turned into evaluation/'s
