@@ -5,7 +5,7 @@
   non-enterprise WiFi network (go2-field, a phone hotspot) don't discover
   each other's /livox/lidar publisher over multicast and cross-talk,
   which drops scan rate from ~10 Hz to ~3 Hz. Enterprise WiFi (SOTON-IoT)
-  filters multicast, so the problem doesn't show up there -- don't assume
+  filters multicast, so the problem doesn't show up there; don't assume
   it's unnecessary just because a test on campus WiFi looked fine.
 
   If either dog's Ethernet subnets ever change, update the whitelist below

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Keep CycloneDDS discovery and data on the Go2's wired interface. eth0
+  carries both 192.168.123.0/24 (Unitree) and 192.168.1.0/24 (Mid-360), so
+  this also prevents two dogs on shared WiFi from discovering each other's
+  LiDAR publishers. This follows Unitree's own single-interface CycloneDDS
+  configuration, with the interface name changed for the Go2 Jetson.
+-->
+<CycloneDDS>
+  <Domain>
+    <General>
+      <Interfaces>
+        <NetworkInterface name="eth0" priority="default" multicast="default"/>
+      </Interfaces>
+    </General>
+  </Domain>
+</CycloneDDS>

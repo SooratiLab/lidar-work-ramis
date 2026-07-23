@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake git \
       libpcl-dev libeigen3-dev libapr1-dev \
       ros-humble-pcl-conversions ros-humble-pcl-ros \
+      ros-humble-rmw-cyclonedds-cpp \
       python3-colcon-common-extensions python3-rosdep \
       gettext-base \
       python3-numpy python3-scipy python3-sklearn \
@@ -79,18 +80,18 @@ RUN source /opt/ros/humble/setup.bash \
 # Runtime configuration
 # ---------------------------------------------------------------------------
 COPY config/fastrtps_eth0_only.xml /opt/fastrtps_eth0_only.xml
+COPY config/cyclonedds_eth0.xml /opt/cyclonedds_eth0.xml
 COPY config/MID360_config.json.template /opt/MID360_config.json.template
 COPY entrypoint.sh /opt/entrypoint.sh
 RUN chmod +x /opt/entrypoint.sh
 
-# CycloneDDS is the Jetson's factory default and is what segfaulted on node
-# creation in Kei's Foxy setup (go2-jetson-setup.md section 10). Whether
-# that bug is Foxy-specific or also affects Humble hasn't been tested yet --
-# FastRTPS is kept as the default here because it's the combination actually
-# proven to work, not because CycloneDDS is assumed broken on Humble too.
-# Override at `docker run` time to test the alternative once real hardware
-# is available (see DOCS.md).
-ENV RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+# CycloneDDS matches Unitree's own ROS 2 stack and is now the default test
+# path on Humble. Kei's node-creation crash was in the host's Foxy install,
+# so it should not be carried forward as an assumption about this image.
+# docker-compose.yml exposes RMW_IMPLEMENTATION for an immediate Fast DDS
+# fallback if the live Jetson test finds a Humble-specific problem.
+ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+ENV CYCLONEDDS_URI=file:///opt/cyclonedds_eth0.xml
 ENV FASTRTPS_DEFAULT_PROFILES_FILE=/opt/fastrtps_eth0_only.xml
 
 ENTRYPOINT ["/opt/entrypoint.sh"]

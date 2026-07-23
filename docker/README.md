@@ -22,7 +22,8 @@ docker-compose.yml                driver + FastLIO + bag-replay + perception + e
 .env.example                      copy to .env, set LIVOX_LIDAR_IP (and BAG_PATH for replay/export)
 config/
   MID360_config.json.template     driver config with ${LIVOX_LIDAR_IP} etc.
-  fastrtps_eth0_only.xml           DDS multicast whitelist (loopback + Ethernet only)
+  cyclonedds_eth0.xml              CycloneDDS wired-interface restriction
+  fastrtps_eth0_only.xml           Fast DDS fallback multicast whitelist
 ```
 
 `docker-compose.yml` has three profiles:
@@ -491,12 +492,19 @@ Verified so far, by actually running it, not just building it:
 - The full `docker compose --profile replay up` workflow (not just manual
   `docker run` commands) has been run end to end and reproduces the same
   result.
+- CycloneDDS has been verified locally with that replay profile against
+  `dog1/2026-05-12_16_21_soton_indoor`, using the development computer's
+  active interface override. Cross-container rates were ~10 Hz for
+  `/livox/lidar`, `/cloud_registered`, and `/Odometry`; the perception node
+  processed all 24 accumulated frames, reproduced the two persistent tracks,
+  and averaged 10.5 ms per processed frame. This verifies the Humble replay
+  path, not the Go2 Jetson or native Unitree DDS topics.
 
 Not yet verified: an actual Mid-360 talking to this container, an actual
 Jetson build, and whether CycloneDDS's node-creation segfault (which forced
-FastRTPS on the Foxy setup this replaces) still happens on Humble. FastRTPS
-is kept as the default RMW here because it's the combination proven to
-work, not because CycloneDDS is assumed still broken.
+Fast DDS on the Foxy setup this replaces) still happens on Humble. CycloneDDS
+is now the default live-test path; Fast DDS remains an environment-variable
+fallback because it is already known to work.
 
 Whether this container can run *live*, right now, on a Jetson that hasn't
 been reflashed yet (still JetPack 5.1.x/Ubuntu 20.04/Foxy) rather than
@@ -508,3 +516,49 @@ container and not a patch script, but three concrete things -- Docker
 actually present on the Jetson, an aarch64 build, and the segfault
 question re-tested from inside a container -- are still unconfirmed
 either way).
+CycloneDDS is the default. Rebuild after pulling this change so the image
+contains Humble's CycloneDDS RMW implementation:
+
+```bash
+docker compose build
+docker compose --profile hardware up -d
+```
+
+Confirm every service received the same RMW selection:
+
+```bash
+docker compose --profile hardware exec driver printenv RMW_IMPLEMENTATION
+docker compose --profile hardware exec fastlio printenv RMW_IMPLEMENTATION
+docker compose --profile hardware exec perception printenv RMW_IMPLEMENTATION
+```
+
+All three should print `rmw_cyclonedds_cpp`. Then perform the topic-rate and
+container-log checks below. A Foxy-era node-creation failure would appear
+immediately in `docker compose --profile hardware logs`.
+
+To fall back without editing any files, recreate the stack with Fast DDS:
+
+```bash
+docker compose --profile hardware down
+RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+  docker compose --profile hardware up -d --force-recreate
+```
+
+The existing Fast DDS Ethernet whitelist remains in the image and is selected
+automatically by `FASTRTPS_DEFAULT_PROFILES_FILE`. Use the same environment
+prefix on later `docker compose` commands for that session, or put
+`RMW_IMPLEMENTATION=rmw_fastrtps_cpp` in `.env` until the CycloneDDS issue is
+understood.
+
+The CycloneDDS file intentionally names the Go2 Jetson's `eth0`. For replay on
+a development computer whose active interface has another name, override the
+URI for the whole Compose invocation:
+
+```bash
+CYCLONEDDS_URI='<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="YOUR_INTERFACE" priority="default" multicast="default"/></Interfaces></General></Domain></CycloneDDS>' \
+  BAG_PATH=/absolute/path/to/bag \
+  docker compose --profile replay up
+```
+
+Use `ip -br addr` to find `YOUR_INTERFACE`. This override is only for local
+replay; leave it unset on the Go2 so DDS remains restricted to `eth0`.

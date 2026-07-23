@@ -1,3 +1,8 @@
+x-dds-environment: &dds-environment
+  RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+  CYCLONEDDS_URI: ${CYCLONEDDS_URI:-file:///opt/cyclonedds_eth0.xml}
+  FASTRTPS_DEFAULT_PROFILES_FILE: /opt/fastrtps_eth0_only.xml
+
 services:
   driver:
     build: .
@@ -17,8 +22,9 @@ services:
     # still enforced -- just at the right time, by entrypoint.sh inside the
     # container, when the driver command actually runs.
     environment:
-      - LIVOX_LIDAR_IP=${LIVOX_LIDAR_IP:-}
-      - LIVOX_HOST_IP=${LIVOX_HOST_IP:-192.168.1.50}
+      <<: *dds-environment
+      LIVOX_LIDAR_IP: ${LIVOX_LIDAR_IP:-}
+      LIVOX_HOST_IP: ${LIVOX_HOST_IP:-192.168.1.50}
     command: ["driver"]
     restart: unless-stopped
     profiles: ["hardware"]
@@ -27,6 +33,7 @@ services:
     image: go2-lidar-humble:latest
     container_name: go2-fastlio
     network_mode: host
+    environment: *dds-environment
     command: ["fastlio"]
     restart: unless-stopped
     profiles: ["hardware", "replay", "export"]
@@ -45,6 +52,7 @@ services:
     image: go2-lidar-humble:latest
     container_name: go2-bag-replay
     network_mode: host
+    environment: *dds-environment
     volumes:
       # rosbag2's sqlite3 storage plugin needs write access to the bag's
       # own directory even just to play it back -- it opens the database
@@ -72,6 +80,7 @@ services:
     image: go2-lidar-humble:latest
     container_name: go2-online-perception
     network_mode: host
+    environment: *dds-environment
     volumes:
       - ../perception:/opt/perception:ro
     command: ["python3", "/opt/perception/online_perception_node.py"]
@@ -99,6 +108,7 @@ services:
     image: go2-lidar-humble:latest
     container_name: go2-bag-export
     network_mode: host
+    environment: *dds-environment
     volumes:
       - ../export:/opt/export:ro
       - ${EXPORT_OUTPUT_DIR:-../data/export}:/output:rw
