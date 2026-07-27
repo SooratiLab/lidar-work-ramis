@@ -146,3 +146,58 @@ def test_previously_visible_mask_empty_input():
     image = build_range_image(np.empty((0, 3)), np.zeros(3), 180, 90)
     mask = previously_visible_mask(np.empty((0, 3)), np.zeros(3), image, 180, 90, tolerance=0.3)
     assert len(mask) == 0
+
+
+def test_range_ratio_keeps_absolute_tolerance_for_near_point():
+    origin = np.zeros(3)
+    image = build_range_image(
+        np.array([[5.0, 0.0, 0.0]]), origin, 180, 90)
+
+    # Two percent of 4.6 m is below the 0.3 m floor, so this remains a
+    # 0.4 m occlusion and is retained exactly as with the established gate.
+    mask = previously_visible_mask(
+        np.array([[4.6, 0.0, 0.0]]),
+        origin,
+        image,
+        180,
+        90,
+        tolerance=0.3,
+        tolerance_range_ratio=0.02,
+    )
+
+    assert bool(mask[0]) is True
+
+
+def test_range_ratio_rejects_small_far_range_difference():
+    origin = np.zeros(3)
+    image = build_range_image(
+        np.array([[30.0, 0.0, 0.0]]), origin, 180, 90)
+    candidate = np.array([[29.5, 0.0, 0.0]])
+
+    fixed = previously_visible_mask(
+        candidate, origin, image, 180, 90, tolerance=0.3)
+    adaptive = previously_visible_mask(
+        candidate,
+        origin,
+        image,
+        180,
+        90,
+        tolerance=0.3,
+        tolerance_range_ratio=0.02,
+    )
+
+    assert bool(fixed[0]) is True
+    assert bool(adaptive[0]) is False
+
+
+def test_visibility_tolerances_must_be_non_negative():
+    with np.testing.assert_raises_regex(ValueError, "non-negative"):
+        previously_visible_mask(
+            np.array([[1.0, 0.0, 0.0]]),
+            np.zeros(3),
+            np.array([[2.0]]),
+            1,
+            1,
+            tolerance=0.3,
+            tolerance_range_ratio=-0.01,
+        )

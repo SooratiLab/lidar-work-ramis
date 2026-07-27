@@ -106,7 +106,8 @@ def build_range_image(points: np.ndarray, origin: np.ndarray,
 def previously_visible_mask(points: np.ndarray, prev_origin: np.ndarray,
                              prev_range_image: np.ndarray,
                              azimuth_bins: int, elevation_bins: int,
-                             tolerance: float) -> np.ndarray:
+                             tolerance: float,
+                             tolerance_range_ratio: float = 0.0) -> np.ndarray:
     """
     For each point, look up the previous frame's range image in the same
     direction from prev_origin (the previous frame's own sensor position)
@@ -118,17 +119,30 @@ def previously_visible_mask(points: np.ndarray, prev_origin: np.ndarray,
     farther (revealed background, not something new). See the module
     docstring for the full reasoning.
 
-    tolerance (m) should be a little looser than the raw Euclidean
+    tolerance (m) is an absolute noise floor and should be a little looser
+    than the raw Euclidean
     change_threshold this gate runs downstream of -- it's comparing a
     single ray's range across two different viewpoints and bin
     discretisations, a noisier signal than nearest-neighbour distance
     within one point cloud.
+
+    tolerance_range_ratio optionally increases that tolerance with the
+    candidate's range, reflecting that angular binning, pose error, and
+    LiDAR range uncertainty have a larger metric effect farther from the
+    sensor. Zero preserves the established fixed-tolerance behaviour.
     """
     if len(points) == 0:
         return np.zeros(0, dtype=bool)
+    if tolerance < 0 or tolerance_range_ratio < 0:
+        raise ValueError("visibility tolerances must be non-negative")
 
     ranges, azimuth, elevation = points_to_spherical(points, prev_origin)
     az_idx, el_idx = _bin_indices(azimuth, elevation, azimuth_bins, elevation_bins)
     previous_ranges = prev_range_image[el_idx, az_idx]
+    effective_tolerance = np.maximum(
+        tolerance, tolerance_range_ratio * ranges)
 
-    return np.isfinite(previous_ranges) & (ranges < previous_ranges - tolerance)
+    return (
+        np.isfinite(previous_ranges)
+        & (ranges < previous_ranges - effective_tolerance)
+    )

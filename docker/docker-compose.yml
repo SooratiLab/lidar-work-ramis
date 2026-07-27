@@ -85,7 +85,18 @@ services:
       DOG_ID: ${DOG_ID:-dog}
     volumes:
       - ../perception:/opt/perception:ro
-    command: ["python3", "/opt/perception/online_perception_node.py"]
+    command:
+      - "python3"
+      - "/opt/perception/online_perception_node.py"
+      - "--ros-args"
+      - "-p"
+      - "use_occlusion_accumulation:=${USE_OCCLUSION_ACCUMULATION:-false}"
+      - "-p"
+      - "accumulate_scans:=${PERCEPTION_ACCUMULATE_SCANS:-10}"
+      - "-p"
+      - "accumulate_stride:=${PERCEPTION_ACCUMULATE_STRIDE:-0}"
+      - "-p"
+      - "cluster_min_points:=${PERCEPTION_CLUSTER_MIN_POINTS:-10}"
     profiles: ["hardware", "replay"]
     depends_on:
       - fastlio

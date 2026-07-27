@@ -64,7 +64,10 @@ def test_run_pipeline_confirms_a_track_on_its_second_detection(tmp_path):
         np.concatenate([_BACKGROUND_MM, _cluster_mm((1000.0, 1000.0, 0.0))]),
         np.concatenate([_BACKGROUND_MM, _cluster_mm((1500.0, 1500.0, 0.0))]),
     ]
-    session_dir = _write_session(tmp_path, frames_mm, frame_timestamps=[0.0, 1.0, 2.0])
+    # Non-integer timestamps also verify that output time is real elapsed
+    # sensor time, not an accidental alias of the frame index.
+    session_dir = _write_session(
+        tmp_path, frames_mm, frame_timestamps=[10.0, 10.4, 11.4])
 
     track_rows, frame_summaries = run_pipeline(
         session_dir, PipelineParams(use_visibility_gate=False))
@@ -80,6 +83,7 @@ def test_run_pipeline_confirms_a_track_on_its_second_detection(tmp_path):
     assert len(frame_2_rows) == 1
     row = frame_2_rows[0]
     assert row["status"] == "matched"
+    np.testing.assert_allclose(row["time_s"], 1.4)
     np.testing.assert_allclose([row["centroid_x_m"], row["centroid_y_m"]], [1.5, 1.5], atol=0.1)
     # ~0.5 m displacement over 1 s -> a walking-pace speed, not noise.
     assert 0.3 < row["speed_m_s"] < 1.0

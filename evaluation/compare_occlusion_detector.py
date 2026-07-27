@@ -67,25 +67,38 @@ def main():
     parser.add_argument(
         "--output-dir", type=Path,
         help="default: output/<session-name>-occlusion-comparison")
+    parser.add_argument("--voxel", type=float, default=0.05)
+    parser.add_argument("--change-threshold", type=float, default=0.15)
+    parser.add_argument("--cluster-eps", type=float, default=0.5)
+    parser.add_argument("--cluster-min-points", type=int, default=10)
+    parser.add_argument("--min-hits", type=int, default=2)
     parser.add_argument("--azimuth-bins", type=int, default=72)
     parser.add_argument("--elevation-bins", type=int, default=36)
     parser.add_argument("--max-gap-bins", type=int, default=1)
     parser.add_argument(
         "--completion-range-difference", type=float, default=0.3)
-    parser.add_argument("--contribution-floor", type=float, default=0.05)
-    parser.add_argument(
-        "--contribution-range-ratio", type=float, default=0.005)
     parser.add_argument("--reappearance-floor", type=float, default=0.10)
     parser.add_argument(
-        "--reappearance-range-ratio", type=float, default=0.01)
+        "--reappearance-range-ratio", type=float, default=0.10)
     parser.add_argument("--activation-threshold", type=float, default=0.30)
-    parser.add_argument("--activation-range-ratio", type=float, default=0.60)
+    parser.add_argument("--activation-range-ratio", type=float, default=0.30)
     parser.add_argument("--point-depth-tolerance", type=float, default=0.50)
     args = parser.parse_args()
+    if args.voxel <= 0 or args.change_threshold < 0:
+        parser.error("voxel must be positive and change threshold non-negative")
+    if args.cluster_eps <= 0 or args.cluster_min_points < 1 or args.min_hits < 1:
+        parser.error("clustering values and min-hits must be positive")
 
     output_dir = args.output_dir or (
         Path("output") / f"{args.session_dir.name}-occlusion-comparison")
-    baseline_params = PipelineParams()
+    baseline_params = replace(
+        PipelineParams(),
+        voxel_size=args.voxel,
+        change_threshold=args.change_threshold,
+        cluster_eps=args.cluster_eps,
+        cluster_min_points=args.cluster_min_points,
+        min_hits=args.min_hits,
+    )
     experimental_params = replace(
         baseline_params,
         use_occlusion_accumulation=True,
@@ -94,8 +107,6 @@ def main():
         occlusion_max_gap_bins=args.max_gap_bins,
         occlusion_completion_range_difference=(
             args.completion_range_difference),
-        occlusion_contribution_floor=args.contribution_floor,
-        occlusion_contribution_range_ratio=args.contribution_range_ratio,
         occlusion_reappearance_floor=args.reappearance_floor,
         occlusion_reappearance_range_ratio=args.reappearance_range_ratio,
         occlusion_activation_threshold=args.activation_threshold,
@@ -124,6 +135,10 @@ def main():
         ),
         "baseline": baseline_summary,
         "occlusion_accumulation": experimental_summary,
+        "shared_pipeline_parameters": {
+            key: value for key, value in asdict(baseline_params).items()
+            if not key.startswith("occlusion_")
+        },
         "occlusion_parameters": {
             key: value for key, value in asdict(experimental_params).items()
             if key.startswith("occlusion_")

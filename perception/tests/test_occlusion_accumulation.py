@@ -34,13 +34,11 @@ def test_complete_small_gaps_does_not_cascade_across_large_gap():
     assert np.all(np.isinf(completed[0, 1:4]))
 
 
-def test_accumulator_requires_temporal_evidence_before_activation():
+def test_accumulator_discards_subthreshold_evidence_each_frame():
     accumulator = OcclusionAccumulator(
         azimuth_bins=72,
         elevation_bins=36,
         max_gap_bins=0,
-        contribution_floor=0.01,
-        contribution_range_ratio=0.0,
         activation_threshold=0.5,
         activation_range_ratio=0.0,
     )
@@ -52,8 +50,27 @@ def test_accumulator_requires_temporal_evidence_before_activation():
 
     assert len(first.moved_points) == 0
     assert len(second.moved_points) == 0
-    assert len(third.moved_points) == 1
-    assert third.n_active_bins == 1
+    assert len(third.moved_points) == 0
+    assert third.n_active_bins == 0
+
+
+def test_accumulator_carries_evidence_after_initial_activation():
+    accumulator = OcclusionAccumulator(
+        azimuth_bins=72,
+        elevation_bins=36,
+        max_gap_bins=0,
+        activation_threshold=0.5,
+        activation_range_ratio=0.0,
+    )
+    origin = np.zeros(3)
+
+    accumulator.update(np.array([[5.0, 0.0, 0.0]]), origin)
+    activated = accumulator.update(np.array([[4.0, 0.0, 0.0]]), origin)
+    carried = accumulator.update(np.array([[3.9, 0.0, 0.0]]), origin)
+
+    assert len(activated.moved_points) == 1
+    assert len(carried.moved_points) == 1
+    assert carried.accumulated_occlusion_m.max() > 1.0
 
 
 def test_accumulator_does_not_flag_static_surface():
@@ -73,8 +90,6 @@ def test_accumulator_reprojects_static_world_when_sensor_moves():
         azimuth_bins=360,
         elevation_bins=90,
         max_gap_bins=0,
-        contribution_floor=0.01,
-        contribution_range_ratio=0.0,
     )
     static_world = np.array([[5.0, 0.0, 0.0], [5.0, 1.0, 0.0]])
 
@@ -91,8 +106,6 @@ def test_background_reappearance_clears_accumulated_occlusion():
         azimuth_bins=72,
         elevation_bins=36,
         max_gap_bins=0,
-        contribution_floor=0.01,
-        contribution_range_ratio=0.0,
         activation_threshold=0.2,
         activation_range_ratio=0.0,
         reappearance_floor=0.01,
@@ -115,8 +128,6 @@ def test_reset_forgets_previous_frame_and_evidence():
         azimuth_bins=72,
         elevation_bins=36,
         max_gap_bins=0,
-        contribution_floor=0.01,
-        contribution_range_ratio=0.0,
         activation_threshold=0.2,
         activation_range_ratio=0.0,
     )

@@ -11,13 +11,13 @@ sensor origin, which is the world-frame equivalent of warping a sensor-frame
 range image with the relative pose. Accumulated evidence is carried by its
 nearest observed world point and reprojected in the same way.
 
-This is deliberately an offline experiment, not a replacement for
-``range_image.previously_visible_mask`` yet. In particular, the paper's
+This remains an experimental alternative to
+``range_image.previously_visible_mask``. It is available offline and behind a
+default-off live-node flag for controlled tests. The paper's
 range-proportional thresholds were tuned on automotive spinning-LiDAR
-datasets. The defaults below expose the same underlying principles
-(accumulate occlusion, reject small changes, clear on background
-reappearance) but use conservative metre-based starting values suitable for
-testing against this project's sparse Mid-360/FastLIO recordings.
+datasets; the defaults here retain its alpha/beta ratios as starting values
+while adding explicit metre floors for this project's sparse
+Mid-360/FastLIO recordings.
 """
 from dataclasses import dataclass
 
@@ -188,12 +188,10 @@ class OcclusionAccumulator:
         elevation_bins: int = 36,
         max_gap_bins: int = 1,
         completion_range_difference: float = 0.3,
-        contribution_floor: float = 0.05,
-        contribution_range_ratio: float = 0.005,
         reappearance_floor: float = 0.10,
-        reappearance_range_ratio: float = 0.01,
+        reappearance_range_ratio: float = 0.10,
         activation_threshold: float = 0.30,
-        activation_range_ratio: float = 0.60,
+        activation_range_ratio: float = 0.30,
         point_depth_tolerance: float = 0.50,
         max_accumulation: float = 5.0,
     ):
@@ -202,8 +200,6 @@ class OcclusionAccumulator:
         nonnegative = {
             "max_gap_bins": max_gap_bins,
             "completion_range_difference": completion_range_difference,
-            "contribution_floor": contribution_floor,
-            "contribution_range_ratio": contribution_range_ratio,
             "reappearance_floor": reappearance_floor,
             "reappearance_range_ratio": reappearance_range_ratio,
             "activation_threshold": activation_threshold,
@@ -218,8 +214,6 @@ class OcclusionAccumulator:
         self.elevation_bins = elevation_bins
         self.max_gap_bins = int(max_gap_bins)
         self.completion_range_difference = completion_range_difference
-        self.contribution_floor = contribution_floor
-        self.contribution_range_ratio = contribution_range_ratio
         self.reappearance_floor = reappearance_floor
         self.reappearance_range_ratio = reappearance_range_ratio
         self.activation_threshold = activation_threshold
@@ -322,45 +316,38 @@ class OcclusionAccumulator:
         range_difference = np.zeros_like(self._accumulation)
         range_difference[common] = previous[common] - current[common]
 
-        contribution_threshold = np.maximum(
-            self.contribution_floor,
-            self.contribution_range_ratio * np.where(
-                np.isfinite(current), current, 0.0),
-        )
         reappearance_threshold = np.maximum(
             self.reappearance_floor,
             self.reappearance_range_ratio * np.where(
                 np.isfinite(current), current, 0.0),
         )
         current_observed = np.isfinite(current_raw)
-        positive = (
-            common
-            & current_observed
-            & (range_difference > contribution_threshold)
-        )
+        positive = common & current_observed & (range_difference > 0.0)
         reappeared = common & (range_difference < -reappearance_threshold)
 
         accumulation = self._warp_accumulation(sensor_position)
-        accumulation[positive] += range_difference[positive]
+        measured = common & current_observed
+        accumulation[measured] += range_difference[measured]
         # Evidence without a current measured support point cannot be safely
         # carried into another frame. Reappearance is stronger negative
         # evidence and explicitly clears the old occlusion.
         accumulation[~current_observed | ~common | reappeared] = 0.0
-        np.clip(accumulation, 0.0, self.max_accumulation, out=accumulation)
 
-        # Kim et al.'s truncation keeps accumulated occlusion only once it
-        # exceeds alpha * current range (alpha=0.3 in their experiments).
-        # This experiment defaults to 0.6 because the available PCD "frames"
-        # merge ten Mid-360 scans from different poses and produced many
-        # false tracks at 0.3. It is a conservative screening value, not a
-        # claimed sensor calibration. The absolute floor also keeps
-        # near-range behaviour explicit.
+        # Equation (8) in Kim et al. truncates weak accumulated evidence on
+        # every sequence. This ordering matters: retaining sub-threshold
+        # changes lets small pose and sampling errors build indefinitely
+        # until they eventually look like motion, which is not the published
+        # method. Evidence persists only after a single update has crossed
+        # the range-proportional threshold; subsequent signed differences
+        # can then strengthen or weaken it.
         activation_threshold = np.maximum(
             self.activation_threshold,
             self.activation_range_ratio * np.where(
                 np.isfinite(current_raw), current_raw, 0.0),
         )
-        active_bins = accumulation >= activation_threshold
+        accumulation[accumulation <= activation_threshold] = 0.0
+        np.clip(accumulation, 0.0, self.max_accumulation, out=accumulation)
+        active_bins = accumulation > 0.0
         if len(points):
             nearest_ranges = current_raw[point_elevation, point_azimuth]
             on_nearest_surface = (

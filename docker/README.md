@@ -298,6 +298,22 @@ That separates image/DDS/perception failures from live Livox networking. Stop
 it with Ctrl+C after `go2-online-perception` has logged several processed
 frames.
 
+For the default-off per-scan occlusion A/B test, keep
+`ACTUATION_ENABLED=false` and change only these `.env` values:
+
+```text
+USE_OCCLUSION_ACCUMULATION=true
+PERCEPTION_ACCUMULATE_SCANS=1
+PERCEPTION_ACCUMULATE_STRIDE=1
+PERCEPTION_CLUSTER_MIN_POINTS=5
+```
+
+The normal values are `false`, `10`, `0`, and `10`. Restore them before the
+baseline run. The node rejects occlusion accumulation with a multi-scan
+window, because offline testing confirmed that merging several sensor poses
+violates the detector's assumptions. Record both runs and compare tracks;
+do not enable actuation while screening an experimental detector.
+
 ### 6. Start the live stack and verify it from the bottom up
 
 ```bash

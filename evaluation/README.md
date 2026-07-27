@@ -16,6 +16,7 @@ pcd_io.py               binary PCD reader (x/y/z, matching export_fastlio.py's o
 offline_pipeline.py     replays an exported session through perception/tracking.py
 compare_pipelines.py    CLI: run + compare + visualise, one command per session
 compare_occlusion_detector.py  A/B test experimental range-image accumulation
+compare_visibility_tolerance.py  A/B test fixed vs range-adaptive visibility
 response_evaluator.py   applies the response policy to tracks + odometry
 tests/                  unit tests for the offline pipeline and response evaluator
 ```
@@ -41,37 +42,86 @@ the recordings have no pointwise moving/static ground truth.
 
 The implementation adapts Kim et al.'s 2025 occlusion-accumulation paper; see
 `../CITATIONS.md` for the citation and precise implementation differences.
-The conservative experiment defaults (72x36 bins, one-bin completion,
-activation at `max(0.3 m, 0.6 * range)`) are not copied paper parameters or
-claimed Mid-360 calibration. An initial `0.3 * range` run at 180x90 produced
-51 tracks on `soton_indoor` versus the known baseline's two, so it was not
-retained merely because it followed the paper more literally.
+The first implementation retained weak sub-threshold differences across
+frames. Reviewing the paper's equations showed that its truncation instead
+sets evidence below `alpha * range` to zero on every sequence; otherwise small
+pose and sampling errors can eventually accumulate into motion. The corrected
+implementation follows that ordering and uses the paper's starting ratios
+(`alpha=0.3`, `beta=0.1`) with an explicit 0.3 m activation floor.
 
-Initial screening with the conservative defaults (runtime is wall-clock and
-will vary with machine load):
+Corrected screening on the original ten-scan exports (runtime is wall-clock
+and will vary with machine load):
 
 | session | established tracks | experimental tracks | established / experimental moved points | established / experimental mean runtime |
 |---|---:|---:|---:|---:|
-| `soton_indoor_dog1` | 2 | 2 | 797 / 616 | ~9 / ~47 ms |
-| `walk_test` | 13 | 26 | 5,593 / 6,900 | ~10 / ~64 ms |
-| `fallback_dog2` | 7 | 8 | 3,894 / 4,155 | ~8 / ~65 ms |
+| `soton_indoor_dog1` | 2 | 2 | 797 / 995 | ~9 / ~70 ms |
+| `walk_test` | 13 | 41 | 5,593 / 13,146 | ~10 / ~96 ms |
+| `fallback_dog2` | 7 | 10 | 3,894 / 7,052 | ~8 / ~95 ms |
 
-This is a **mixed/negative result for the available offline input**. The
-stationary known-good session retains its two tracks, and `fallback_dog2` is
-close, but the walking session doubles the already-imperfect track count.
+This remains a **negative result for the aggregate input**. Disabling gap
+completion reduces runtime to roughly 6–11 ms/frame, but still produces
+34/10/2 tracks on the three sessions respectively, so completion is neither
+the sole cause nor worth its Python prototype cost.
+
 The likely structural mismatch is that each exported PCD frame combines ten
 registered scans acquired from different sensor poses. The paper updates one
 organized scan from one pose at a time; treating a ten-origin aggregate as
 one spherical image creates range discontinuities that its assumptions do not
-cover. Ground segmentation and the paper's full-object completion are also
+cover. Ground segmentation and the paper's full-object expansion are also
 absent.
 
-Consequently, this detector is not wired into the live node and does not
-change current behaviour. The justified next experiment is a per-scan bag or
-live comparison using each `/cloud_registered` message with its matching
-odometry, followed by independently-labelled walking/crossing tests. Tuning
-the aggregated-frame approximation further would risk fitting artefacts of
-the export format rather than validating the method.
+A new export of `soton_indoor_dog1` with `--accumulate 1` provides 242
+individual scans and 242 matching poses. With `cluster_min_points=5`, no gap
+completion, and a 0.05 m baseline change threshold:
+
+- the baseline confirms one track with four measured rows;
+- the accumulator confirms one track with 28 measured rows;
+- the accumulator trajectory follows the same `y ~= -1.59 m` path as one
+  known aggregate-frame track; and
+- mean runtime is about 2.2 ms/frame for the accumulator versus 2.1 ms/frame
+  for the baseline.
+
+This is promising evidence for the lightweight core, not an accuracy claim:
+the recording lacks point labels and this configuration does not recover the
+other known aggregate trajectory. Enabling one-bin completion adds a second,
+intermittent track but raises runtime to roughly 48 ms/frame; that track is not
+trusted without manual labels.
+
+The live node therefore retains the established detector by default. A guarded
+`use_occlusion_accumulation:=true` mode exists solely for physical A/B testing,
+requires `accumulate_scans:=1` and `accumulate_stride:=1`, and uses no gap
+completion. A suitable starting command-line parameter set is:
+
+```text
+-p use_occlusion_accumulation:=true
+-p accumulate_scans:=1
+-p accumulate_stride:=1
+-p cluster_min_points:=5
+```
+
+Do not connect this mode to actuation during initial tests. Record both the
+normal and experimental track topics against labelled walking, crossing,
+standing, and no-person scenes first.
+
+### Experimental range-adaptive visibility tolerance
+
+`compare_visibility_tolerance.py` screens an inexpensive extension of the
+established visibility gate:
+
+```bash
+python3 evaluation/compare_visibility_tolerance.py \
+    data/2026-04-24_walk_test --tolerance-range-ratio 0.02
+```
+
+The effective tolerance is
+`max(range_image_tolerance, ratio * candidate_range)`. Zero is the live
+default and exactly preserves existing behaviour. Ratios of 0.01, 0.02, and
+0.03 changed no moved points or tracks on any of the three exports because
+the existing 0.3 m floor dominated at their detection ranges. A ratio of 0.05
+removed only 9–26 points per session and changed no confirmed track count;
+0.10 removed more points but still changed no track count. There is no
+recorded-data justification for enabling it by default, though the option is
+available for a genuinely longer-range dataset.
 
 ### Evaluating the stop response
 

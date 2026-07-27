@@ -8,7 +8,8 @@ Dr. Mohammad Soorati.
 
 Research papers, algorithms, scientific software, standards, and inherited
 project work used here are tracked in [`CITATIONS.md`](CITATIONS.md), including
-the relationship between each source and this implementation.
+the relationship between each source and this implementation. Reusable search
+queries for finding related work are grouped in [`keywords.md`](keywords.md).
 
 ## Background
 
@@ -78,10 +79,11 @@ each subdirectory's README for exactly what has and hasn't been tested.
   and false-positive-reduction numbers above as concrete artifacts instead
   of log excerpts. It also contains an opt-in A/B evaluator for an
   experimental temporal range-image occlusion accumulator adapted from Kim
-  et al. (2025). Initial exported-frame results are not promoted to the live
-  node: the stationary baseline is preserved, but a moving session produces
-  substantially more tracks because each export merges ten sensor poses into
-  one range image. See `evaluation/README.md`.
+  et al. (2025), plus an A/B test for range-adaptive visibility tolerance.
+  Aggregate-frame results remain negative, while a one-scan export found one
+  promising persistent trajectory from the lightweight accumulator. A guarded,
+  default-off live mode now exists for physical testing only; it refuses the
+  invalid ten-scan configuration. See `evaluation/README.md`.
 - **`export/`** -- ports Kei's `export_fastlio.py` (originally a manual
   step in a three-terminal WSL2/Jazzy workflow, see
   `kei-stuff/ros2-go2/laptop-wsl-setup.md`) into a `docker-compose`

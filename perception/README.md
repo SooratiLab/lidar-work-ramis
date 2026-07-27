@@ -317,6 +317,38 @@ before/after comparison against the same recorded session without a code
 change -- see "Testing against more recorded sessions" below for the
 comparison this was validated with.
 
+`range_image_tolerance_ratio` (default `0.0`) optionally changes the fixed
+0.3 m gate to `max(0.3 m, ratio * candidate range)`. Offline sweeps from
+0.01 to 0.03 were exact no-ops on three recordings; 0.05 removed only 9–26
+points per session and changed no confirmed track count. It remains
+experimental and disabled because current data provides no benefit.
+
+### Per-scan occlusion-accumulation experiment
+
+`use_occlusion_accumulation` defaults to `False` and does not alter the
+established detector. When enabled it replaces nearest-neighbour differencing
+and the visibility gate with the corrected temporal range-image accumulator.
+The node refuses this mode unless both `accumulate_scans` and
+`accumulate_stride` are 1: running it on a ten-scan aggregate violates the
+method's one-scan/one-pose assumption and performed badly offline.
+
+The live experiment also disables range-image gap completion. On a 242-scan
+`soton_indoor` export this lightweight configuration ran at about 2.2
+ms/frame and followed one known trajectory for 28 measured frames, compared
+with four measurements from the retuned per-scan baseline. Completion was
+roughly twenty times slower and introduced a questionable intermittent
+track. These are screening results without pointwise ground truth, so the
+mode is for tomorrow's labelled A/B test, not response or actuation.
+
+Start with:
+
+```text
+-p use_occlusion_accumulation:=true
+-p accumulate_scans:=1
+-p accumulate_stride:=1
+-p cluster_min_points:=5
+```
+
 ## Testing against more recorded sessions
 
 Beyond the `soton_indoor` session used to validate the initial rewrite (see

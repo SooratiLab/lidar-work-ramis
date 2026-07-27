@@ -70,6 +70,7 @@ class PipelineParams:
     range_image_azimuth_bins: int = 72
     range_image_elevation_bins: int = 36
     range_image_tolerance: float = 0.3
+    range_image_tolerance_ratio: float = 0.0
     kalman_position_std: float = 0.1
     kalman_velocity_std: float = 2.0
     kalman_process_std: float = 1.0
@@ -81,12 +82,10 @@ class PipelineParams:
     occlusion_elevation_bins: int = 36
     occlusion_max_gap_bins: int = 1
     occlusion_completion_range_difference: float = 0.3
-    occlusion_contribution_floor: float = 0.05
-    occlusion_contribution_range_ratio: float = 0.005
     occlusion_reappearance_floor: float = 0.10
-    occlusion_reappearance_range_ratio: float = 0.01
+    occlusion_reappearance_range_ratio: float = 0.10
     occlusion_activation_threshold: float = 0.30
-    occlusion_activation_range_ratio: float = 0.60
+    occlusion_activation_range_ratio: float = 0.30
     occlusion_point_depth_tolerance: float = 0.50
 
 
@@ -156,8 +155,6 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
             max_gap_bins=params.occlusion_max_gap_bins,
             completion_range_difference=(
                 params.occlusion_completion_range_difference),
-            contribution_floor=params.occlusion_contribution_floor,
-            contribution_range_ratio=params.occlusion_contribution_range_ratio,
             reappearance_floor=params.occlusion_reappearance_floor,
             reappearance_range_ratio=(
                 params.occlusion_reappearance_range_ratio),
@@ -167,6 +164,7 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
         )
 
     prev_frame = prev_stamp = prev_position = None
+    first_frame_stamp = None
     track_rows = []
     frame_summaries = []
 
@@ -178,6 +176,8 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
 
         frame_position = odom_positions.get(frame_idx)
         frame_stamp = odom_stamps.get(frame_idx, float(frame_idx))
+        if first_frame_stamp is None:
+            first_frame_stamp = frame_stamp
 
         if prev_frame is None or len(prev_frame) == 0:
             if occlusion_accumulator is not None:
@@ -221,7 +221,8 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
                 keep = previously_visible_mask(
                     moved, prev_position, prev_range_image,
                     params.range_image_azimuth_bins, params.range_image_elevation_bins,
-                    params.range_image_tolerance)
+                    params.range_image_tolerance,
+                    params.range_image_tolerance_ratio)
                 moved = moved[keep]
 
         clusters = cluster_moved_points(moved, params.cluster_eps, params.cluster_min_points)
@@ -238,7 +239,7 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
             track_rows.append({
                 "track_id": track_id,
                 "frame": frame_idx,
-                "time_s": float(frame_idx),
+                "time_s": float(frame_stamp - first_frame_stamp),
                 "centroid_x_m": float(track.position[0]),
                 "centroid_y_m": float(track.position[1]),
                 "centroid_z_m": float(track.position[2]),

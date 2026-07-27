@@ -276,6 +276,23 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  discretised bin, not
                                                  nearest-neighbour distance
                                                  within one point cloud.
+    range_image_tolerance_ratio  (float, default 0.0)  optional additional
+                                                 tolerance proportional to
+                                                 candidate range. Effective
+                                                 tolerance is max(the 0.3 m
+                                                 floor, ratio * range).
+                                                 Zero preserves the
+                                                 established fixed gate;
+                                                 nonzero values remain
+                                                 experimental.
+    use_occlusion_accumulation (bool, default False) experimental alternative
+                                                 moving-point detector. It
+                                                 requires one scan per frame
+                                                 and odometry, and deliberately
+                                                 disables costly range-image
+                                                 gap completion. The normal
+                                                 nearest-neighbour detector is
+                                                 unchanged when false.
     kalman_position_std   (float, default 0.1)   assumed centroid
                                                  measurement noise (m) --
                                                  how much a single DBSCAN
@@ -346,6 +363,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pointcloud import pointcloud2_to_xyz, voxel_downsample
 from tracking import CentroidTracker, cluster_moved_points, filter_plausible_detections
 from range_image import build_range_image, previously_visible_mask
+from occlusion_accumulation import OcclusionAccumulator
 
 
 def _track_colour(track_id: int) -> tuple:
@@ -383,6 +401,8 @@ class OnlinePerceptionNode(Node):
         self.declare_parameter("range_image_azimuth_bins", 72)
         self.declare_parameter("range_image_elevation_bins", 36)
         self.declare_parameter("range_image_tolerance", 0.3)
+        self.declare_parameter("range_image_tolerance_ratio", 0.0)
+        self.declare_parameter("use_occlusion_accumulation", False)
         self.declare_parameter("kalman_position_std", 0.1)
         self.declare_parameter("kalman_velocity_std", 2.0)
         self.declare_parameter("kalman_process_std", 1.0)
@@ -405,11 +425,21 @@ class OnlinePerceptionNode(Node):
         self._range_image_azimuth_bins = self.get_parameter("range_image_azimuth_bins").value
         self._range_image_elevation_bins = self.get_parameter("range_image_elevation_bins").value
         self._range_image_tolerance = self.get_parameter("range_image_tolerance").value
+        self._range_image_tolerance_ratio = self.get_parameter(
+            "range_image_tolerance_ratio").value
+        self._use_occlusion_accumulation = self.get_parameter(
+            "use_occlusion_accumulation").value
         self._z_max = self.get_parameter("z_max").value
         self._frame_id = self.get_parameter("frame_id").value
         self._dog_id = self.get_parameter("dog_id").value
         if not self._dog_id:
             raise ValueError("dog_id must be a non-empty string")
+        if self._use_occlusion_accumulation and (
+            self._accumulate_scans != 1 or self._accumulate_stride != 1
+        ):
+            raise ValueError(
+                "experimental occlusion accumulation requires "
+                "accumulate_scans=1 and accumulate_stride=1")
 
         self._max_missed_frames = self.get_parameter("max_missed_frames").value
         self._max_missed_seconds = self.get_parameter("max_missed_seconds").value
@@ -432,6 +462,13 @@ class OnlinePerceptionNode(Node):
         self._prev_frame = None            # downsampled points, last completed frame
         self._prev_frame_stamp = None
         self._prev_frame_position = None   # sensor position (m) at that frame, for the visibility gate
+        # Completion dominated prototype runtime and introduced an
+        # intermittent extra track in per-scan screening. The first live
+        # experiment keeps only the lightweight corrected accumulator.
+        self._occlusion_accumulator = (
+            OcclusionAccumulator(max_gap_bins=0)
+            if self._use_occlusion_accumulation else None
+        )
         self._frame_count = 0
         # Local track IDs and frame sequence numbers restart with this node.
         # A boot/session identifier lets a peer distinguish that legitimate
@@ -464,7 +501,9 @@ class OnlinePerceptionNode(Node):
             f"reid_max_distance={self._reid_max_distance}, "
             f"reid_window_seconds={self._reid_window_seconds}, "
             f"max_sensor_range={self._max_sensor_range}, "
-            f"use_visibility_gate={self._use_visibility_gate})")
+            f"use_visibility_gate={self._use_visibility_gate}, "
+            f"use_occlusion_accumulation="
+            f"{self._use_occlusion_accumulation})")
 
     def _odom_cb(self, msg: Odometry) -> None:
         self._latest_odom = msg
@@ -530,6 +569,11 @@ class OnlinePerceptionNode(Node):
         self._frame_count += 1
 
         if self._prev_frame is None or len(self._prev_frame) == 0:
+            if (
+                self._occlusion_accumulator is not None
+                and frame_position is not None
+            ):
+                self._occlusion_accumulator.update(frame, frame_position)
             self._prev_frame = frame
             self._prev_frame_stamp = stamp
             self._prev_frame_position = frame_position
@@ -539,13 +583,32 @@ class OnlinePerceptionNode(Node):
                 f"nothing to compare against yet")
             return
 
-        # Points in this frame far from anything in the previous frame are
-        # considered "moved".
-        tree = cKDTree(self._prev_frame)
-        distances, _ = tree.query(frame, k=1)
-        moved = frame[distances > self._change_threshold]
-
-        moved, n_unseen = self._apply_visibility_gate(moved)
+        if self._occlusion_accumulator is not None:
+            if frame_position is None:
+                if not self._logged_missing_odom_for_visibility_warning:
+                    self.get_logger().warning(
+                        "no /Odometry received yet -- experimental "
+                        "occlusion detector cannot update")
+                    self._logged_missing_odom_for_visibility_warning = True
+                self._occlusion_accumulator.reset()
+                moved = np.empty((0, 3))
+            else:
+                if (
+                    self._prev_frame_stamp is not None
+                    and stamp < self._prev_frame_stamp
+                ):
+                    self._occlusion_accumulator.reset()
+                result = self._occlusion_accumulator.update(
+                    frame, frame_position)
+                moved = result.moved_points
+            n_unseen = 0
+        else:
+            # Points far from the previous frame are candidate motion, then
+            # checked against what that previous viewpoint could see.
+            tree = cKDTree(self._prev_frame)
+            distances, _ = tree.query(frame, k=1)
+            moved = frame[distances > self._change_threshold]
+            moved, n_unseen = self._apply_visibility_gate(moved)
 
         clusters = cluster_moved_points(moved, self._cluster_eps, self._cluster_min_points)
         clusters, n_implausible = self._drop_implausible_clusters(clusters)
@@ -597,7 +660,8 @@ class OnlinePerceptionNode(Node):
         keep = previously_visible_mask(
             moved_points, self._prev_frame_position, prev_range_image,
             self._range_image_azimuth_bins, self._range_image_elevation_bins,
-            self._range_image_tolerance)
+            self._range_image_tolerance,
+            self._range_image_tolerance_ratio)
         return moved_points[keep], int((~keep).sum())
 
     def _drop_implausible_clusters(self, clusters):
