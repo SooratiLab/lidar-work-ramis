@@ -92,3 +92,58 @@ def test_run_pipeline_reports_nothing_for_a_static_scene(tmp_path):
     track_rows, _ = run_pipeline(session_dir, PipelineParams(use_visibility_gate=False))
 
     assert track_rows == []
+
+
+def test_run_pipeline_can_use_experimental_occlusion_accumulation(tmp_path):
+    # The object moves towards the sensor while obscuring the same background
+    # patch. Positive range differences therefore persist in nearby angular
+    # bins and should provide two detections for normal tracker confirmation.
+    frames_mm = [
+        _BACKGROUND_MM,
+        np.concatenate([
+            _BACKGROUND_MM,
+            _cluster_mm((2000.0, 2000.0, 0.0)),
+        ]),
+        np.concatenate([
+            _BACKGROUND_MM,
+            _cluster_mm((1500.0, 1500.0, 0.0)),
+        ]),
+    ]
+    session_dir = _write_session(
+        tmp_path, frames_mm, frame_timestamps=[0.0, 1.0, 2.0])
+
+    track_rows, frame_summaries = run_pipeline(
+        session_dir,
+        PipelineParams(
+            use_occlusion_accumulation=True,
+            occlusion_azimuth_bins=72,
+            occlusion_elevation_bins=36,
+            occlusion_max_gap_bins=2,
+            occlusion_activation_threshold=0.2,
+            occlusion_activation_range_ratio=0.0,
+        ),
+    )
+
+    assert "occlusion" in frame_summaries[1]
+    assert frame_summaries[1]["occlusion"]["active_bins"] > 0
+    assert len(frame_summaries[1]["moved"]) >= 10
+    assert any(row["frame"] == 2 for row in track_rows)
+
+
+def test_occlusion_pipeline_requires_pose_for_every_frame(tmp_path):
+    session_dir = _write_session(
+        tmp_path,
+        [_BACKGROUND_MM, _BACKGROUND_MM],
+        frame_timestamps=[0.0, 1.0],
+    )
+    # Keep the header but remove all pose rows.
+    with open(session_dir / "poses.csv", "w", newline="") as handle:
+        csv.writer(handle).writerow(
+            ["frame", "timestamp", "x", "y", "z", "qx", "qy", "qz", "qw"])
+
+    with np.testing.assert_raises_regex(
+        ValueError, "requires an odometry pose"):
+        run_pipeline(
+            session_dir,
+            PipelineParams(use_occlusion_accumulation=True),
+        )

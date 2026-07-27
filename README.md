@@ -6,6 +6,10 @@ LiDAR work by Ramis Bhatty (rb3g23), continuing from Kei Kheng Tan's
 week Summer Internship at the University of Southampton, supervised by
 Dr. Mohammad Soorati.
 
+Research papers, algorithms, scientific software, standards, and inherited
+project work used here are tracked in [`CITATIONS.md`](CITATIONS.md), including
+the relationship between each source and this implementation.
+
 ## Background
 
 Kei's pipeline records LiDAR data in the field with two Unitree Go2 EDU
@@ -72,7 +76,12 @@ each subdirectory's README for exactly what has and hasn't been tested.
   producing trajectory/speed/track-count plots and a frame-by-frame
   point-cloud gif per session. Reproduces the "2 tracks on `soton_indoor`"
   and false-positive-reduction numbers above as concrete artifacts instead
-  of log excerpts. See `evaluation/README.md`.
+  of log excerpts. It also contains an opt-in A/B evaluator for an
+  experimental temporal range-image occlusion accumulator adapted from Kim
+  et al. (2025). Initial exported-frame results are not promoted to the live
+  node: the stationary baseline is preserved, but a moving session produces
+  substantially more tracks because each export merges ten sensor poses into
+  one range image. See `evaluation/README.md`.
 - **`export/`** -- ports Kei's `export_fastlio.py` (originally a manual
   step in a three-terminal WSL2/Jazzy workflow, see
   `kei-stuff/ros2-go2/laptop-wsl-setup.md`) into a `docker-compose`

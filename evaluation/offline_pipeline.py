@@ -16,20 +16,13 @@ rclpy dependency -- see tracking.py's own module docstring) instead of
 re-deriving the algorithm or standing up a live ROS graph.
 
 Why offline against already-exported frames rather than a fresh live
-replay: this machine's ROS 2 DDS discovery doesn't work at all in practice
--- confirmed with a plain rclpy publisher/subscriber pair failing to
-discover each other even within a single process on this box, not just
-across the driver/FastLIO/perception container boundary docker-compose
-normally spans. Chasing that further wasn't worth it against a dev laptop
-that was never going to be the deployment target anyway (the Jetson is the
-one that matters, and DDS discovery there is a separate, real open
-question already tracked as its own item). Running the identical tracking
-code against identical exported input sidesteps the networking question
-entirely and is arguably a cleaner comparison against Kei's offline
-pipeline besides: both pipelines then see exactly the same points and
-odometry, so any difference in output is attributable to the tracking
-algorithm, not to two independent FastLIO runs producing slightly
-different registration.
+replay: running the identical tracking code against identical exported input
+is a controlled comparison. Both pipelines see exactly the same points and
+odometry, so their output differences are attributable to the perception
+algorithms rather than two independent FastLIO runs producing slightly
+different registration. A later re-check also confirmed that ROS 2 DDS bag
+replay works on this machine, so networking is no longer a reason for this
+choice.
 
 Units: metres throughout the returned data (matching perception/'s own
 convention) -- PCD millimetres are converted on load, immediately.
@@ -48,17 +41,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "perception"))
 from pointcloud import voxel_downsample
 from tracking import CentroidTracker, cluster_moved_points, filter_plausible_detections
 from range_image import build_range_image, previously_visible_mask
+from occlusion_accumulation import OcclusionAccumulator
 
 
 @dataclass
 class PipelineParams:
     """
-    Mirrors online_perception_node.py's declared ROS parameters and their
-    defaults exactly (see that module's docstring for what each one does
-    and why it's set the way it is) -- this dataclass exists so a
-    comparison run uses the same values that would actually ship on real
-    hardware, not a separately-tuned copy that could quietly drift from
-    the node's own defaults over time.
+    The established detector and tracker fields mirror
+    online_perception_node.py's declared ROS parameters and defaults (see
+    that module's docstring for what each one does and why). Experimental
+    occlusion fields are appended below and remain disabled by default.
+    Keeping both configurations here makes an A/B run explicit and prevents
+    the established half from quietly drifting away from the live node.
     """
     voxel_size: float = 0.05
     change_threshold: float = 0.15
@@ -79,6 +73,21 @@ class PipelineParams:
     kalman_position_std: float = 0.1
     kalman_velocity_std: float = 2.0
     kalman_process_std: float = 1.0
+    # Experimental alternative to nearest-neighbour differencing plus the
+    # one-frame visibility gate. Disabled by default so established results
+    # and the live node's behaviour are unchanged.
+    use_occlusion_accumulation: bool = False
+    occlusion_azimuth_bins: int = 72
+    occlusion_elevation_bins: int = 36
+    occlusion_max_gap_bins: int = 1
+    occlusion_completion_range_difference: float = 0.3
+    occlusion_contribution_floor: float = 0.05
+    occlusion_contribution_range_ratio: float = 0.005
+    occlusion_reappearance_floor: float = 0.10
+    occlusion_reappearance_range_ratio: float = 0.01
+    occlusion_activation_threshold: float = 0.30
+    occlusion_activation_range_ratio: float = 0.60
+    occlusion_point_depth_tolerance: float = 0.50
 
 
 def load_frame_poses(poses_csv: Path):
@@ -117,7 +126,7 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
                   going to the ROS logger.
       frame_summaries: one dict per frame -- frame, points (voxel-
                   downsampled, z-cropped, metres), moved (this frame's
-                  points flagged as moved after both gates, metres). Used
+                  points flagged by the selected detector, metres). Used
                   by compare_pipelines.py to draw the point-cloud
                   animation; not needed if you only want the tracks CSV.
     """
@@ -139,6 +148,23 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
         reid_max_distance=params.reid_max_distance,
         reid_window_seconds=params.reid_window_seconds,
     )
+    occlusion_accumulator = None
+    if params.use_occlusion_accumulation:
+        occlusion_accumulator = OcclusionAccumulator(
+            azimuth_bins=params.occlusion_azimuth_bins,
+            elevation_bins=params.occlusion_elevation_bins,
+            max_gap_bins=params.occlusion_max_gap_bins,
+            completion_range_difference=(
+                params.occlusion_completion_range_difference),
+            contribution_floor=params.occlusion_contribution_floor,
+            contribution_range_ratio=params.occlusion_contribution_range_ratio,
+            reappearance_floor=params.occlusion_reappearance_floor,
+            reappearance_range_ratio=(
+                params.occlusion_reappearance_range_ratio),
+            activation_threshold=params.occlusion_activation_threshold,
+            activation_range_ratio=params.occlusion_activation_range_ratio,
+            point_depth_tolerance=params.occlusion_point_depth_tolerance,
+        )
 
     prev_frame = prev_stamp = prev_position = None
     track_rows = []
@@ -154,23 +180,49 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
         frame_stamp = odom_stamps.get(frame_idx, float(frame_idx))
 
         if prev_frame is None or len(prev_frame) == 0:
-            frame_summaries.append({"frame": frame_idx, "points": points_m, "moved": np.empty((0, 3))})
+            if occlusion_accumulator is not None:
+                if frame_position is None:
+                    raise ValueError(
+                        "occlusion accumulation requires an odometry pose "
+                        f"for every frame; frame {frame_idx} has none")
+                occlusion_accumulator.update(points_m, frame_position)
+            frame_summaries.append({
+                "frame": frame_idx,
+                "points": points_m,
+                "moved": np.empty((0, 3)),
+            })
             prev_frame, prev_stamp, prev_position = points_m, frame_stamp, frame_position
             continue
 
-        tree = cKDTree(prev_frame)
-        distances, _ = tree.query(points_m, k=1)
-        moved = points_m[distances > params.change_threshold]
+        occlusion_diagnostics = None
+        if occlusion_accumulator is not None:
+            if frame_position is None:
+                raise ValueError(
+                    "occlusion accumulation requires an odometry pose "
+                    f"for every frame; frame {frame_idx} has none")
+            if prev_stamp is not None and frame_stamp < prev_stamp:
+                occlusion_accumulator.reset()
+            result = occlusion_accumulator.update(points_m, frame_position)
+            moved = result.moved_points
+            occlusion_diagnostics = {
+                "positive_bins": result.n_positive_bins,
+                "reappeared_bins": result.n_reappeared_bins,
+                "active_bins": result.n_active_bins,
+            }
+        else:
+            tree = cKDTree(prev_frame)
+            distances, _ = tree.query(points_m, k=1)
+            moved = points_m[distances > params.change_threshold]
 
-        if params.use_visibility_gate and len(moved) > 0 and prev_position is not None:
-            prev_range_image = build_range_image(
-                prev_frame, prev_position,
-                params.range_image_azimuth_bins, params.range_image_elevation_bins)
-            keep = previously_visible_mask(
-                moved, prev_position, prev_range_image,
-                params.range_image_azimuth_bins, params.range_image_elevation_bins,
-                params.range_image_tolerance)
-            moved = moved[keep]
+            if params.use_visibility_gate and len(moved) > 0 and prev_position is not None:
+                prev_range_image = build_range_image(
+                    prev_frame, prev_position,
+                    params.range_image_azimuth_bins, params.range_image_elevation_bins)
+                keep = previously_visible_mask(
+                    moved, prev_position, prev_range_image,
+                    params.range_image_azimuth_bins, params.range_image_elevation_bins,
+                    params.range_image_tolerance)
+                moved = moved[keep]
 
         clusters = cluster_moved_points(moved, params.cluster_eps, params.cluster_min_points)
         if clusters and frame_position is not None:
@@ -197,7 +249,14 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
                            "coasting" if info["is_coasting"] else "matched"),
             })
 
-        frame_summaries.append({"frame": frame_idx, "points": points_m, "moved": moved})
+        frame_summary = {
+            "frame": frame_idx,
+            "points": points_m,
+            "moved": moved,
+        }
+        if occlusion_diagnostics is not None:
+            frame_summary["occlusion"] = occlusion_diagnostics
+        frame_summaries.append(frame_summary)
         prev_frame, prev_stamp, prev_position = points_m, frame_stamp, frame_position
 
     return track_rows, frame_summaries

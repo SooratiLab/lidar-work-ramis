@@ -15,9 +15,63 @@ pipeline reported on the same data."
 pcd_io.py               binary PCD reader (x/y/z, matching export_fastlio.py's output)
 offline_pipeline.py     replays an exported session through perception/tracking.py
 compare_pipelines.py    CLI: run + compare + visualise, one command per session
+compare_occlusion_detector.py  A/B test experimental range-image accumulation
 response_evaluator.py   applies the response policy to tracks + odometry
 tests/                  unit tests for the offline pipeline and response evaluator
 ```
+
+### Experimental occlusion accumulation
+
+`compare_occlusion_detector.py` changes only the moving-point detector. The
+baseline uses the established nearest-neighbour difference plus one-frame
+visibility gate; the experiment uses the temporal range-image accumulator in
+`perception/occlusion_accumulation.py`. Both then use identical DBSCAN and
+tracking parameters:
+
+```bash
+python3 evaluation/compare_occlusion_detector.py \
+    data/2026-05-12_soton_indoor_dog1
+```
+
+It writes `baseline_tracks.csv`, `occlusion_tracks.csv`, and `summary.json`
+under `output/<session>-occlusion-comparison/`. The summary includes moved
+point counts, confirmed IDs, first-confirmed frame, runtime, and accumulator
+pixel diagnostics. These are screening measurements, not accuracy metrics:
+the recordings have no pointwise moving/static ground truth.
+
+The implementation adapts Kim et al.'s 2025 occlusion-accumulation paper; see
+`../CITATIONS.md` for the citation and precise implementation differences.
+The conservative experiment defaults (72x36 bins, one-bin completion,
+activation at `max(0.3 m, 0.6 * range)`) are not copied paper parameters or
+claimed Mid-360 calibration. An initial `0.3 * range` run at 180x90 produced
+51 tracks on `soton_indoor` versus the known baseline's two, so it was not
+retained merely because it followed the paper more literally.
+
+Initial screening with the conservative defaults (runtime is wall-clock and
+will vary with machine load):
+
+| session | established tracks | experimental tracks | established / experimental moved points | established / experimental mean runtime |
+|---|---:|---:|---:|---:|
+| `soton_indoor_dog1` | 2 | 2 | 797 / 616 | ~9 / ~47 ms |
+| `walk_test` | 13 | 26 | 5,593 / 6,900 | ~10 / ~64 ms |
+| `fallback_dog2` | 7 | 8 | 3,894 / 4,155 | ~8 / ~65 ms |
+
+This is a **mixed/negative result for the available offline input**. The
+stationary known-good session retains its two tracks, and `fallback_dog2` is
+close, but the walking session doubles the already-imperfect track count.
+The likely structural mismatch is that each exported PCD frame combines ten
+registered scans acquired from different sensor poses. The paper updates one
+organized scan from one pose at a time; treating a ten-origin aggregate as
+one spherical image creates range discontinuities that its assumptions do not
+cover. Ground segmentation and the paper's full-object completion are also
+absent.
+
+Consequently, this detector is not wired into the live node and does not
+change current behaviour. The justified next experiment is a per-scan bag or
+live comparison using each `/cloud_registered` message with its matching
+odometry, followed by independently-labelled walking/crossing tests. Tuning
+the aggregated-frame approximation further would risk fitting artefacts of
+the export format rather than validating the method.
 
 ### Evaluating the stop response
 
@@ -51,48 +105,19 @@ commanded. `fallback_dog1` cannot be evaluated: its known-empty `poses.csv`
 provides no sensor position, and the evaluator fails clearly rather than
 silently measuring distance from the map origin.
 
-## Why this runs offline, not over a live bag replay
+## Why this runs offline
 
-The obvious way to compare would be replaying a bag through this repo's
-`docker/` FastLIO image with `perception/online_perception_node.py`
-subscribed live, the same way `docker compose --profile replay` normally
-works. That doesn't work on this machine: ROS 2 DDS discovery doesn't
-function here at all, confirmed with a plain `rclpy` publisher/subscriber
-pair failing to discover each other even within a single process, not just
-across the driver/FastLIO/perception container boundary docker-compose
-spans. Worth knowing if this ever needs debugging again, but not worth
-chasing further against a dev machine that was never the deployment target
--- the Jetson is, and DDS there is a separate, real, already-tracked
-question of its own.
+This replays `perception/tracking.py`'s actual clustering/tracking code (no
+`rclpy` dependency) directly against the PCD frames and poses CSV produced by
+Kei's `export_fastlio.py`. Both alternatives therefore see identical points
+and odometry, so output differences are attributable to the algorithms
+rather than small differences between two independent FastLIO runs.
 
-**Update**: re-checked this while building `export/`, since that needed
-the same cross-container DDS path to test against real data, and then
-again directly: re-ran `docker compose --profile replay up` against
-`soton_indoor` end to end. DDS discovery works on this machine now -- the
-`perception` container logged live detections frame by frame, reporting
-the same two tracks and walking-pace speeds this file's own offline
-comparison reports below for the same session. Neither this nor the
-original "broken" finding controlled for what changed in between (machine
-state, Docker version, network config are all plausible, none confirmed),
-so this doesn't explain *why* it started working -- but it is now a
-directly confirmed result, not a "worth retrying" guess. This doesn't
-retroactively invalidate anything below: the offline replay this file
-actually uses is still arguably the *better* comparison regardless
-(identical input to both pipelines being compared, no double-FastLIO-
-registration variance a fresh live replay would introduce), so this
-module's approach is unchanged -- the point of re-checking was just to
-stop citing a stale "doesn't work here" reason for that choice.
-
-Instead, this replays `perception/tracking.py`'s actual clustering/tracking
-code (no `rclpy` dependency -- see that module's own docstring) directly
-against sessions Kei's `export_fastlio.py` already exported to PCD frames +
-a poses CSV. That export is exactly what `online_perception_node.py` would
-see frame-by-frame subscribed live to the same bag replayed through
-FastLIO: same points, same odometry, same accumulate window. This is
-arguably a *cleaner* comparison than a fresh live replay besides: both
-pipelines then see identical points and odometry, so any difference in
-output is attributable to the tracking algorithm, not to two independent
-FastLIO runs producing slightly different registration.
+ROS 2 DDS bag replay has also been re-checked successfully on this machine:
+the perception container reproduced the two `soton_indoor` tracks. Offline
+evaluation remains a methodological choice for controlled A/B testing, not a
+networking workaround. Live replay is still necessary for integration and
+timing checks on the deployment hardware.
 
 ## Usage
 
@@ -196,14 +221,15 @@ From the repository root, all suites can now be collected together:
 python3 -m pytest perception/tests evaluation/tests export/tests merge/tests
 ```
 
-`test_pcd_io.py` covers the binary PCD reader directly. `test_offline_pipeline.py`
-is an integration test against a small synthetic session (a static
-background plus a cluster that appears at two positions one second apart)
-checking that the replay wiring -- PCD loading, voxel downsampling, frame
-diffing, clustering, and the tracker -- reports nothing after the first
-detection and a confirmed, walking-pace track after the second. It
-deliberately doesn't re-test the individual algorithm components
-(clustering, the Kalman tracker, the visibility gate) that already have
-their own direct unit tests in `perception/tests/`.
+`test_pcd_io.py` covers the binary PCD reader directly.
+`test_offline_pipeline.py` uses small synthetic sessions to check both the
+established detector and the optional accumulator through PCD loading,
+voxel downsampling, clustering, and tracking. It also verifies that the
+accumulator fails clearly without the odometry required for reprojection.
+The accumulator's completion, persistence, pose compensation, clearing, and
+reset behaviour have focused tests in
+`perception/tests/test_occlusion_accumulation.py`. The suite deliberately
+doesn't duplicate clustering, Kalman tracking, and one-frame visibility-gate
+tests already present in `perception/tests/`.
 `test_response_evaluator.py` covers empty frames, coast exclusion, required
 odometry, and the machine-readable response CSV.

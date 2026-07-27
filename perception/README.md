@@ -24,6 +24,11 @@ changed and why.
   suppresses "moved" points a moving sensor's own viewpoint change
   produced, rather than something actually moving -- see "Visibility gate"
   below. Plain numpy, no rclpy dependency.
+- `occlusion_accumulation.py` -- experimental pose-compensated temporal
+  range-image detector adapted from Kim et al. (2025). It is used only by
+  the offline A/B evaluator, not the live node; see
+  `../evaluation/README.md` for the mixed initial result and
+  `../CITATIONS.md` for technical attribution.
 - `cluster_response_node.py` / `response_policy.py` -- convert confirmed,
   current tracks into a time-debounced stop request, with stale-input
   handling. The ROS node publishes the request and status; the plain-numpy
