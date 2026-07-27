@@ -18,8 +18,21 @@ import time
 from pathlib import Path
 
 
-CONTAINERS = ("go2-lidar-driver", "go2-fastlio", "go2-online-perception")
-TOPICS = ("/livox/lidar", "/livox/imu", "/cloud_registered", "/Odometry")
+CONTAINERS = (
+    "go2-lidar-driver",
+    "go2-fastlio",
+    "go2-online-perception",
+    "go2-cluster-response",
+    "go2-stop-actuation",
+)
+TOPICS = (
+    "/livox/lidar",
+    "/livox/imu",
+    "/cloud_registered",
+    "/Odometry",
+    "/online_perception/tracks",
+    "/online_perception/stop_requested",
+)
 FRAME_RE = re.compile(r"dt=([0-9.]+)s, processed in ([0-9.]+)ms")
 
 
@@ -169,6 +182,35 @@ def summarize_perception(started_at, output_dir):
     return summary
 
 
+def capture_response_logs(started_at, output_dir, summary):
+    since = started_at.astimezone(dt.timezone.utc).isoformat()
+    components = {
+        "response.log": "go2-cluster-response",
+        "actuation.log": "go2-stop-actuation",
+    }
+    logs = {}
+    for filename, container in components.items():
+        result = run(["docker", "logs", "--since", since, container], timeout=30)
+        (output_dir / filename).write_text(result.stdout, encoding="utf-8")
+        logs[filename] = result.stdout
+
+    summary["response"] = {
+        "stop_transitions_logged": logs["response.log"].count("STOP REQUESTED"),
+        "clear_transitions_logged": logs["response.log"].count(
+            "stop request cleared"),
+        "stale_state_entries_logged": logs["response.log"].count(
+            "state=stale_"),
+    }
+    summary["actuation"] = {
+        "enabled": "enabled=True" in logs["actuation.log"],
+        "dry_run_stop_actions": logs["actuation.log"].count(
+            "would_send_stop_move"),
+        "sent_stop_actions": logs["actuation.log"].count("sent_stop_move"),
+    }
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+
+
 def main():
     args = parse_args()
     if args.duration < 10:
@@ -195,6 +237,7 @@ def main():
         stop_process(tegrastats_process)
 
     summary = summarize_perception(started_at, output_dir)
+    capture_response_logs(started_at, output_dir, summary)
     print(json.dumps(summary, indent=2))
     if not summary["measured_frames"]:
         print("No processed frames were found; inspect perception.log and topic-hz files.",

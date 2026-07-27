@@ -25,8 +25,12 @@ changed and why.
   produced, rather than something actually moving -- see "Visibility gate"
   below. Plain numpy, no rclpy dependency.
 - `cluster_response_node.py` / `response_policy.py` -- convert confirmed,
-  current tracks into a debounced stop request. The ROS node publishes the
-  request; the plain-numpy policy holds the thresholds and hysteresis.
+  current tracks into a time-debounced stop request, with stale-input
+  handling. The ROS node publishes the request and status; the plain-numpy
+  policy holds the thresholds and hysteresis.
+- `stop_actuation_node.py` / `actuation_policy.py` -- disabled-by-default
+  boundary from a stop request to Unitree's `StopMove` API. Its default
+  dry-run mode logs what it would send without creating a Unitree publisher.
 - `tests/` -- unit tests for the plain Python perception and response
   modules (see "Testing" below).
 
@@ -43,18 +47,52 @@ changed and why.
   strong enough evidence to trigger a robot response.
 
 `cluster_response_node.py` measures those track positions from the current
-FastLIO `/Odometry` position. Two consecutive frames with a track within
-`stop_distance` (2.0 m by default) request a stop; two frames with no track
-inside `clear_distance` (2.5 m) clear it. The separate clear threshold
-prevents a noisy centroid near 2 m repeatedly toggling the result. Output is
-`std_msgs/Bool` on `/online_perception/stop_requested`.
+FastLIO `/Odometry` position. A track within `stop_distance` (2.0 m by
+default) continuously for `trigger_duration` (1.0 s) requests a stop.
+Clearing requires no track within `clear_distance` (2.5 m) continuously for
+`clear_duration` (1.0 s). Durations replace the original two-frame counters:
+recorded degraded streams showed that a frame count can represent wildly
+different real elapsed times. Distance is horizontal XY range by default,
+not full 3D range, because centroid height should not make a ground-level
+collision threat appear farther away.
 
-This is deliberately a request, not direct actuation. The replay and
-hardware Compose profiles run the response node, but nothing yet forwards
-the Bool to Unitree's `/api/sport/request`. Add that adapter only after
-CycloneDDS discovery, live detections, and stop-request behaviour have each
-been observed on a stationary Go2; the adapter should default disabled and
-use Unitree's `StopMove` API only.
+Outputs are:
+
+- `/online_perception/stop_requested` (`std_msgs/Bool`), preserving the
+  original machine-readable boundary.
+- `/online_perception/response_status` (`std_msgs/String` containing JSON),
+  with the state, nearest range, and input ages for live diagnosis.
+
+Tracks and odometry must both remain fresh (2.5 s defaults). Missing or stale
+input requests a stop by default rather than interpreting a dead perception
+process as a clear path. `fail_safe_stop:=false` exists for controlled
+diagnostics, but should not be used when actuation is enabled.
+
+`stop_actuation_node.py` is the separate robot boundary. It runs in both
+Compose profiles but defaults to `enabled:=false`: dry-run mode logs
+`would_send_stop_move` and never imports or publishes a Unitree request.
+With `ACTUATION_ENABLED=true`, it publishes API ID 1003 (`StopMove`) on
+`/api/sport/request`, once on the stop edge and then at a bounded repeat
+rate. It also fails safe to StopMove if the response topic itself becomes
+stale. Clearing the request never sends an automatic resume command; the
+operator must resume manually after checking the scene.
+
+This changes response semantics relative to the first prototype (elapsed
+seconds and planar distance instead of frame counts and 3D distance) and
+adds fail-safe stop requests on stale input. The detector/tracker and
+`/online_perception/tracks` output are unchanged. Validate the status and
+dry-run logs on bags and a stationary Go2 before setting
+`ACTUATION_ENABLED=true`.
+
+Validated end to end on 27 July 2026 with the rebuilt Docker image and the
+`soton_indoor` bag: FastLIO produced 24 processed frames, perception
+reproduced the same two known tracks, the response changed
+`clear -> pending_stop -> stop` after the track remained within 2 m for
+1 s, and cleared after it retreated. The adapter received the requests over
+DDS and logged `would_send_stop_move` only. The pinned `unitree_api` package
+also built and was discoverable with `ros2 interface show`. This validates
+bag replay and dry-run wiring, not physical StopMove behaviour; enabled
+actuation has not been run.
 
 ## Why this exists
 
@@ -606,12 +644,13 @@ that's already using a tiny fraction of its budget.
 
 ```bash
 pip install numpy scipy scikit-learn pytest   # or: apt install python3-numpy python3-scipy python3-sklearn
-python3 -m pytest tests/
+python3 -m pytest perception/tests evaluation/tests export/tests merge/tests
 ```
 
 These cover the pure clustering/assignment/Kalman-filter/plausibility-gate
 logic in `tracking.py`, the PointCloud2 parsing/downsampling in
-`pointcloud.py`, and the range-image visibility check in `range_image.py`
+`pointcloud.py`, the range-image visibility check in `range_image.py`, and
+the response/actuation state machines
 -- no ROS install, no bag file, no running node needed, so they're the
 fast repeatable check to run after touching any of the three modules. They
 do not exercise `online_perception_node.py` itself (the ROS wiring) -- that

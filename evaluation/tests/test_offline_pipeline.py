@@ -15,7 +15,7 @@ import csv
 
 import numpy as np
 
-from conftest import write_binary_pcd
+from test_helpers import write_binary_pcd
 from offline_pipeline import PipelineParams, run_pipeline
 
 # Static background, unchanged across every frame -- present so the

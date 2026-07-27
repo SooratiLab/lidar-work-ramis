@@ -237,10 +237,9 @@ def plot_trajectories(kei_persistent, kei_singleton, current_tracks, sensor_path
 def plot_speed_profiles(kei_persistent, current_tracks, session_name, out_dir):
     # A per-track legend stops being useful well before a session like
     # lab_walk_with_stops's ~160 persistent-but-mostly-spurious tracks
-    # (see DOCS.md's "Testing against more sessions" -- this is the same
-    # session, still producing hundreds of raw track IDs with no
-    # confirmation step) -- past this many entries matplotlib can't even
-    # fit the legend in the figure, and every colour repeats anyway.
+    # (the moving-sensor result documented in perception/README.md) -- past
+    # this many entries matplotlib can't even fit the legend in the figure,
+    # and every colour repeats anyway.
     MAX_LEGEND_ENTRIES = 20
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
@@ -378,7 +377,7 @@ def main():
         sensor_path = load_sensor_path(args.session / "poses.csv")
         if len(sensor_path) == 0:
             print(f"note: {args.session}/poses.csv has no rows -- this export has no odometry "
-                  f"at all (confirmed not a copying artifact, see DOCS.md's data inventory notes). "
+                  f"at all (the source export is empty too; this is not a copying artifact). "
                   f"Trajectory plot will omit the sensor path; the visibility/plausibility gates "
                   f"ran fail-open for this session, same as online_perception_node.py would.")
         plot_trajectories(kei_persistent, kei_singleton, current_tracks, sensor_path, session_name, out_dir)

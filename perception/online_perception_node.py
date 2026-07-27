@@ -71,22 +71,20 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  overlap consecutive
                                                  frames and report more
                                                  often -- e.g.
-                                                 accumulate_scans=10,
-                                                 accumulate_stride=5 halves
-                                                 the real-world latency
-                                                 between a new object
-                                                 appearing and its track
-                                                 reaching min_hits
-                                                 confirmations, at the cost
-                                                 of roughly double the
-                                                 clustering work per second
-                                                 (still well inside the
-                                                 processing budget measured
-                                                 during testing -- see
-                                                 perception/README.md's
-                                                 "Overlapping frames"
-                                                 section for the validated
-                                                 tradeoff). Overlap does
+                                                 accumulate_scans=10 and
+                                                 accumulate_stride=5 doubles
+                                                 the processing frequency
+                                                 and roughly doubles the
+                                                 clustering work. A bag A/B
+                                                 test found no detection-
+                                                 latency improvement because
+                                                 each comparison also had
+                                                 roughly half the motion
+                                                 signal; see perception/
+                                                 README.md's "Overlapping
+                                                 frames" section. Overlap
+                                                 therefore remains opt-in,
+                                                 not the default. It does
                                                  not change what counts as
                                                  "moved" between two
                                                  frames -- it only changes
@@ -316,6 +314,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import Pose, PoseArray
 from nav_msgs.msg import Odometry
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from scipy.spatial import cKDTree
 from sensor_msgs.msg import PointCloud2
@@ -733,10 +732,12 @@ def main():
     node = OnlinePerceptionNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ offline_pipeline.py's module docstring for why).
 import numpy as np
 import pytest
 
-from conftest import write_binary_pcd
+from test_helpers import write_binary_pcd
 from pcd_io import load_pcd_xyz_mm
 
 

@@ -17,7 +17,7 @@ source /opt/ros2_ws/install/setup.bash
 render_livox_config() {
     # LIVOX_LIDAR_IP is required here specifically -- each Mid-360's IP is
     # tied to its serial number and must match whichever physical unit is
-    # plugged into this dog (see DOCS.md's hardware reference table).
+    # plugged into this dog (see docker/README.md's first-live-run section).
     # Getting this wrong doesn't fail loudly: livox_ros_driver2 just reports
     # "Storage point data failed" and never publishes any points, which
     # looks like a much harder-to-diagnose problem than a plain "wrong

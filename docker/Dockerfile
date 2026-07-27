@@ -4,8 +4,8 @@
 #
 # Built and tested on x86_64 as a stand-in for the Jetson's aarch64 -- ROS's
 # own Humble base images and every upstream repo cloned below support both
-# architectures, so this should build unmodified on the Jetson once that can
-# be verified against real hardware (see DOCS.md).
+# architectures. The aarch64 build and runtime still need live Jetson
+# verification; see docker/README.md's first-live-run checklist.
 
 FROM ros:humble-ros-base
 
@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libpcl-dev libeigen3-dev libapr1-dev \
       ros-humble-pcl-conversions ros-humble-pcl-ros \
       ros-humble-rmw-cyclonedds-cpp \
+      ros-humble-rosidl-generator-dds-idl \
       python3-colcon-common-extensions python3-rosdep \
       gettext-base \
       python3-numpy python3-scipy python3-sklearn \
@@ -48,6 +49,20 @@ RUN git clone --depth 1 https://github.com/Livox-SDK/livox_ros_driver2.git \
 # whatever the default happens to be at clone time.
 RUN git clone --recursive --depth 1 --branch ros2 \
       https://github.com/Ericsii/FAST_LIO_ROS2.git
+
+# Unitree's small request-message package is needed only by the explicitly
+# enabled StopMove adapter. Fetch the exact revision mirrored under sdks/ in
+# the parent workspace rather than letting a future upstream change alter the
+# wire definition silently.
+ARG UNITREE_ROS2_COMMIT=668d1ec5a05d1c38d3306bdca7d59f2ba3581a88
+RUN git init /tmp/unitree_ros2 \
+    && git -C /tmp/unitree_ros2 remote add origin \
+         https://github.com/unitreerobotics/unitree_ros2.git \
+    && git -C /tmp/unitree_ros2 fetch --depth 1 origin "${UNITREE_ROS2_COMMIT}" \
+    && git -C /tmp/unitree_ros2 checkout FETCH_HEAD \
+    && cp -a /tmp/unitree_ros2/cyclonedds_ws/src/unitree/unitree_api \
+         /opt/ros2_ws/src/unitree_api \
+    && rm -rf /tmp/unitree_ros2
 
 # LiDAR timestamp fix -- see patch_livox_timestamp.py for the full
 # explanation. Needed on every ROS distro; it's a Mid-360 firmware quirk,

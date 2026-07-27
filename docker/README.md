@@ -18,7 +18,7 @@ this), see the repo's internal notes for what's still open.
 Dockerfile                        image build: Livox-SDK2 + colcon workspace
 entrypoint.sh                     renders per-dog LiDAR config, dispatches launch
 patch_livox_timestamp.py          LiDAR/IMU timestamp fix, applied at build time
-docker-compose.yml                driver + FastLIO + bag-replay + perception + export services
+docker-compose.yml                sensor, perception, response, actuation, replay, export services
 .env.example                      copy to .env, set LIVOX_LIDAR_IP (and BAG_PATH for replay/export)
 config/
   MID360_config.json.template     driver config with ${LIVOX_LIDAR_IP} etc.
@@ -28,12 +28,12 @@ config/
 
 `docker-compose.yml` has three profiles:
 
-- **`hardware`** -- `driver` + `fastlio`, for a real Mid-360 plugged into
-  this Jetson.
-- **`replay`** -- `fastlio` + `bag` + `perception`, for testing without a
-  real sensor by replaying one of Kei's recorded bags against a live
-  FastLIO instance instead. See `../perception/README.md` for what that's
-  actually validated so far.
+- **`hardware`** -- `driver` + `fastlio` + `perception` + `response` +
+  `actuation`, for a real Mid-360 plugged into this Jetson. Actuation is a
+  dry run unless explicitly enabled in `.env`.
+- **`replay`** -- `fastlio` + `bag` plus the same perception/response/dry-run
+  actuation path, for testing without a real sensor by replaying one of
+  Kei's recorded bags. See `../perception/README.md`.
 - **`export`** -- `fastlio` + `bag` + `export`, for turning a bag into the
   `pcd/` + `poses.csv` layout `../evaluation/` expects, without a live
   ROS graph to watch or a separate node to run. See `../export/README.md`.
@@ -57,12 +57,18 @@ cp .env.example .env
 docker compose --profile hardware up
 ```
 
-This starts both the LiDAR driver and FastLIO. `docker-compose.yml` uses
+This starts the LiDAR driver, FastLIO, perception, response, and the
+disabled-by-default actuation adapter. `docker-compose.yml` uses
 `network_mode: host` -- the Livox SDK binds directly to the host's
 LiDAR-subnet address rather than going through Docker's usual NAT'd bridge
 network, so bridge networking fails outright with `bind failed` (confirmed
 while testing this image without a real LiDAR-subnet interface present).
 Host networking isn't a convenience here, it's required.
+
+The actuation adapter is a dry run while `.env` contains
+`ACTUATION_ENABLED=false` (the shipped default). It logs
+`would_send_stop_move` but cannot publish `/api/sport/request`. Do not change
+this setting until the stationary checklist below passes.
 
 To run just one piece:
 
@@ -312,11 +318,17 @@ docker exec go2-fastlio timeout 15 ros2 topic hz /Odometry
 # Perception output. It needs two accumulated frames before it can compare
 # motion, so allow roughly 2-3 seconds with the default 10-scan windows.
 docker logs --since 2m go2-online-perception
+docker logs --since 2m go2-cluster-response
+docker logs --since 2m go2-stop-actuation
 ```
 
-Success means all four topics publish continuously and perception logs lines
+Success means the sensor/FastLIO topics publish continuously and perception
+logs lines
 of the form `frame ... processed in ...ms`. Confirmed tracks appear as
-`track N [new|matched|coasting|reidentified]`. No tracks in an empty, static
+`track N [new|matched|coasting|reidentified]`. The response log should move
+through `clear`, `pending_stop`, and `stop` as a person crosses the 2 m
+boundary, and the actuation log should say `would_send_stop_move`, never
+`sent_stop_move`, during this first check. No tracks in an empty, static
 scene is healthy; frame processing is the liveness check. Walk a person across
 the LiDAR view before moving the dog, then repeat while walking the dog slowly.
 This distinguishes basic detection from the harder moving-viewpoint case.
@@ -343,7 +355,10 @@ The collector uses only the Python standard library. It writes:
 - `docker-stats.csv`: per-container CPU and memory once per second;
 - `tegrastats.txt`: Jetson clocks, temperatures, RAM, and power telemetry
   when the host provides `tegrastats`;
-- `perception.log`, platform/version files, and the exact container state.
+- `perception.log`, `response.log`, and `actuation.log`;
+- response transition counts, stale-state entries, and dry-run/sent actuation
+  counts in `summary.json`;
+- platform/version files and the exact container state.
 
 Use separate directories for at least three runs: stationary empty scene,
 stationary with a walker, and dog moving with a walker. Run the same route and
@@ -377,6 +392,28 @@ A practical pass criterion is:
   sustained thermal throttling;
 - the moving run produces plausible, persistent tracks rather than a flood of
   one-frame IDs or positions tens of metres from the robot.
+- the stationary-walker run produces the expected stop/clear transition and
+  dry-run StopMove action, with no stale-input entries during the healthy
+  portion of the run.
+
+### Enabling StopMove after the stationary dry run
+
+Only after the topic rates, response threshold, and dry-run action have been
+observed together on a stationary dog:
+
+```bash
+# Stop the profile before editing the safety boundary.
+docker compose --profile hardware down
+sed -i 's/^ACTUATION_ENABLED=false$/ACTUATION_ENABLED=true/' .env
+docker compose --profile hardware up
+```
+
+On startup, verify `go2-stop-actuation` logs `enabled=True`. A stop request
+publishes Unitree API ID 1003 (`StopMove`) and repeats it at most once per
+second while the request remains active. Clearing the request deliberately
+does not resume walking; recovery is manual. Keep the controller in hand and
+test StopMove with the dog already standing before attempting commanded
+motion. Return `ACTUATION_ENABLED=false` immediately after the test.
 
 ### 8. Stop cleanly and copy the evidence off the dog
 
@@ -405,6 +442,9 @@ rather than only killing individual processes.
 | Raw topics publish but FastLIO topics do not | LiDAR/IMU timestamps or FastLIO startup | Confirm both raw rates, restart the whole profile, and check FastLIO for sync warnings; the image already applies the known timestamp patch |
 | FastLIO publishes but perception has no frames | DDS discovery or perception crash | `docker compose ... ps`, then `docker logs go2-online-perception`; all services must use host networking |
 | Frames process but no tracks appear | Static scene, insufficient points, or live density differs from replay data | First cross the view at walking pace; inspect moved/cluster counts before tuning parameters |
+| Response stays in `waiting_*` or `stale_*` | Tracks or odometry are absent/older than 2.5 s | Check both topic rates and response logs; stale input requests a stop by default |
+| Dry-run adapter logs nothing | Stop threshold did not persist for 1 s, or response DDS path is broken | Echo `/online_perception/stop_requested`; keep actuation disabled while diagnosing |
+| Enabled adapter exits immediately | Image predates the pinned `unitree_api` package | Rebuild the current Dockerfile and confirm `ros2 interface show unitree_api/msg/Request` |
 | Topic rate degrades after minutes | LiDAR link/driver dropout or Jetson throttling | Compare topic-hz output with `tegrastats.txt`; check cable/power and temperatures |
 | `benchmark_live.py` reports no frames | Pipeline was not live during the timed window | Read `perception.log` and the four topic-hz files; fix the lowest silent topic first |
 
@@ -422,7 +462,12 @@ Do not begin the moving benchmark until every earlier gate is true:
 - [ ] The Jetson can resolve and reach GitHub, and the tested commit hash is recorded.
 - [ ] `eth0` has both expected addresses and no default route.
 - [ ] The physical LiDAR IP matches `.env` and responds to ping.
-- [ ] Compose built successfully and all three hardware containers are running.
+- [ ] Compose built successfully and all five hardware containers are running.
+- [ ] `.env` still has `ACTUATION_ENABLED=false`.
+- [ ] A threshold crossing produces `would_send_stop_move` in dry-run mode.
+- [ ] Stopping track or odometry input produces a fail-safe stop request.
+- [ ] The operator has verified manual recovery and has the controller ready
+      before the separately-approved enabled StopMove test.
 - [ ] Raw LiDAR and IMU publish; FastLIO cloud and odometry publish continuously.
 - [ ] Perception logs processed frames in a stationary test.
 - [ ] The controller, operator, clear test area, battery, disk space, and cooling are ready.

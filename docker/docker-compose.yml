@@ -89,9 +89,9 @@ services:
       - fastlio
 
   # Conservative first response layer. It converts confirmed, current
-  # perception tracks into a debounced Bool stop request; it deliberately
-  # has no connection to /api/sport/request yet, so replay and initial
-  # hardware validation cannot accidentally command the robot.
+  # perception tracks into a time-debounced Bool stop request. It has no
+  # direct connection to /api/sport/request; the separately-enabled adapter
+  # below owns that safety boundary.
   response:
     image: go2-lidar-humble:latest
     container_name: go2-cluster-response
@@ -103,6 +103,27 @@ services:
     profiles: ["hardware", "replay"]
     depends_on:
       - perception
+
+  # Disabled-by-default Unitree boundary. This service always runs so bag
+  # replay exercises the complete decision path, but ACTUATION_ENABLED must
+  # be set explicitly before it can publish StopMove on /api/sport/request.
+  # Clearing a request never resumes motion automatically.
+  actuation:
+    image: go2-lidar-humble:latest
+    container_name: go2-stop-actuation
+    network_mode: host
+    environment: *dds-environment
+    volumes:
+      - ../perception:/opt/perception:ro
+    command:
+      - python3
+      - /opt/perception/stop_actuation_node.py
+      - --ros-args
+      - -p
+      - enabled:=${ACTUATION_ENABLED:-false}
+    profiles: ["hardware", "replay"]
+    depends_on:
+      - response
 
   # Batch bag -> PCD/poses export -- the one-command replacement for Kei's
   # original WSL2/Jazzy/export_fastlio.py workflow (kei-stuff/ros2-go2/

@@ -151,8 +151,8 @@ have both dogs seeing the same thing.
   systematic test across scenarios -- treat the specific numbers above as
   a demonstration that the approach works on real field data, not as
   tuned defaults proven to generalise.
-- **`fallback_dog1`'s `poses.csv` has zero rows** (a known, separately
-  tracked export bug -- see `TODO.md`'s housekeeping section), so dog 1's
+- **`fallback_dog1`'s `poses.csv` has zero rows** (the source export is
+  empty too, so this is not a copying artifact), so dog 1's
   visibility gate and odometry-plausibility filter both ran fail-open for
   this session (`offline_pipeline.py`'s `frame_position` is `None` for
   every frame). Dog 1's 14 tracks for what's a fairly simple scene likely
@@ -178,8 +178,8 @@ have both dogs seeing the same thing.
   resting on a fairly small number of correspondences (41 matched frames
   across 5 track pairs). A session with more sustained double-coverage
   would be a better test of calibration stability specifically.
-- **No NTP/clock-sync investigation done here.** `TODO.md` flags this as
-  an open Phase 3 question -- frame-index lag search is a coarse stand-in
+- **No NTP/clock-sync investigation done here.** Frame-index lag search is
+  a coarse stand-in
   for real clock synchronisation, tolerant of the "~100ms drift at
   1-second frames" Kei's handover calls tolerable, but not a substitute
   for actually checking it if frame duration ever shrinks for a realtime
@@ -211,9 +211,8 @@ success path.
   transitive correspondence (dog A matches dog C via dog B, but does A
   match C directly?) and picking which dog's frame is the reference for
   more than two need actual design, not just a loop. Not attempted here;
-  only two Mid-360 units exist in the lab currently anyway (see
-  `DOCS.md`'s "Wider project context"), so this hasn't been a practical
-  gap yet.
+  only two Mid-360 units currently exist in the lab, so this hasn't been a
+  practical gap yet.
 - **No automatic prior-free calibration.** `--offset 0,0,0,0` happened to
   work on the cardboard-box session because the true offset was within
   `--max-distance` of identity by chance (the loop trajectory above still
@@ -221,10 +220,9 @@ success path.
   relative pose (dogs facing different directions, further apart) would
   need either a real prior or a proper global search this module doesn't
   attempt -- `calibrate()` refines a prior, it doesn't search for one from
-  nothing (see its docstring). `TODO.md`'s Phase 3 notes list a one-time
-  deployment measurement or a shared landmark as the intended source for
-  that prior; this module is what consumes it once available, not a
-  replacement for measuring it.
+  nothing (see its docstring). A one-time deployment measurement or a
+  shared landmark is the intended source for that prior; this module
+  consumes it once available, not a replacement for measuring it.
 - **No live/realtime version.** This runs against already-exported
   sessions, the same way `evaluation/` does, for the same reason: it's
   the fastest way to validate the actual fusion logic against real data

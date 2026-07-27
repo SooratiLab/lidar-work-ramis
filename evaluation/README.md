@@ -15,8 +15,41 @@ pipeline reported on the same data."
 pcd_io.py               binary PCD reader (x/y/z, matching export_fastlio.py's output)
 offline_pipeline.py     replays an exported session through perception/tracking.py
 compare_pipelines.py    CLI: run + compare + visualise, one command per session
-tests/                  unit tests for pcd_io.py and offline_pipeline.py
+response_evaluator.py   applies the response policy to tracks + odometry
+tests/                  unit tests for the offline pipeline and response evaluator
 ```
+
+### Evaluating the stop response
+
+The response evaluator uses current, measured tracks only (coasted
+predictions are excluded, matching the live ROS topic) and each frame's
+FastLIO pose. It writes `response.csv`, `response_summary.json`, and
+`response.png`:
+
+```bash
+python3 evaluation/response_evaluator.py \
+    data/2026-05-12_soton_indoor_dog1 \
+    --tracks-csv output/2026-05-12_soton_indoor_dog1/2026-05-12_soton_indoor_dog1_tracks.csv
+```
+
+Omit `--tracks-csv` to rerun the current perception pipeline first. Response
+parameters have matching flags (`--stop-distance`, `--clear-distance`,
+`--trigger-duration`, and `--clear-duration`) for an explicit A/B test.
+
+Default-policy checks against the exported data currently present produced:
+
+| session | duration | stop transitions | requested-stop time | minimum planar range |
+|---|---:|---:|---:|---:|
+| `2026-04-24_walk_test` | 74.4 s | 2 | 17.0 s | 0.60 m |
+| `2026-05-12_fallback_dog2` | 92.0 s | 4 | 19.0 s | 1.12 m |
+| `2026-05-12_soton_indoor_dog1` | 23.2 s | 1 | 5.0 s | 1.66 m |
+
+These establish that the policy fires and clears against recorded tracks;
+they are not false-positive or stopping-performance measurements because
+the recordings have no response ground truth and the robot was not being
+commanded. `fallback_dog1` cannot be evaluated: its known-empty `poses.csv`
+provides no sensor position, and the evaluator fails clearly rather than
+silently measuring distance from the map origin.
 
 ## Why this runs offline, not over a live bag replay
 
@@ -149,17 +182,18 @@ total, all single-frame, evidently an early/untuned run) -- re-running
 `track_motion.py` with the documented tuned parameters against the same
 exported frames (`kei_reference_tracks_retuned.csv` in that session's
 `data/` directory) produced the expected result instead (589 raw track
-IDs, matching the same false-positive-heavy pattern `DOCS.md` already
-documents for this session). Check which case a given `--kei-tracks` file
+IDs, matching the false-positive-heavy moving-sensor pattern documented in
+`perception/README.md`). Check which case a given `--kei-tracks` file
 is before trusting a "current pipeline wins by 10x" number -- it might
 just mean the reference was run with the wrong parameters for this data,
 not that the tracker actually improved that much.
 
 ## Testing
 
+From the repository root, all suites can now be collected together:
+
 ```bash
-cd evaluation
-python3 -m pytest tests/
+python3 -m pytest perception/tests evaluation/tests export/tests merge/tests
 ```
 
 `test_pcd_io.py` covers the binary PCD reader directly. `test_offline_pipeline.py`
@@ -171,3 +205,5 @@ detection and a confirmed, walking-pace track after the second. It
 deliberately doesn't re-test the individual algorithm components
 (clustering, the Kalman tracker, the visibility gate) that already have
 their own direct unit tests in `perception/tests/`.
+`test_response_evaluator.py` covers empty frames, coast exclusion, required
+odometry, and the machine-readable response CSV.
