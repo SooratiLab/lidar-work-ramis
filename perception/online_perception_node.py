@@ -54,6 +54,14 @@ Publishes:
                                    the RViz markers, coasted predictions
                                    are excluded so control consumers do
                                    not react to stale evidence.
+    /online_perception/track_observations (std_msgs/String, JSON) -- the
+                                   same current confirmed tracks with local
+                                   track ID, velocity, cluster size, point
+                                   count, source timestamp, sensor position,
+                                   and dog_id preserved for the inter-dog
+                                   exchange prototype. This is informational;
+                                   the stop policy continues to consume the
+                                   simpler PoseArray boundary above.
 
 Parameters (all overridable via --ros-args -p <name>:=<value>):
     accumulate_scans     (int,   default 10)    scans merged per frame --
@@ -291,6 +299,9 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  actually publishing
                                                  /cloud_registered in if
                                                  that ever changes
+    dog_id                 (str,   default "dog") source identifier in rich
+                                                 inter-dog track packets;
+                                                 set uniquely per robot
 
 Defaults for the detection-side parameters match the FastLIO-tuned values in
 lidar-perception/README.md's track_motion.py parameter table (converted
@@ -305,8 +316,11 @@ against recorded sessions during testing, not tuned against a live sensor
 yet.
 """
 import colorsys
+import json
+import os
 import sys
 import time
+import uuid
 from collections import deque
 from pathlib import Path
 
@@ -318,6 +332,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from scipy.spatial import cKDTree
 from sensor_msgs.msg import PointCloud2
+from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 
 # Local, non-ROS modules living alongside this script -- see pointcloud.py,
@@ -373,6 +388,7 @@ class OnlinePerceptionNode(Node):
         self.declare_parameter("kalman_process_std", 1.0)
         self.declare_parameter("z_max", 2.5)
         self.declare_parameter("frame_id", "camera_init")
+        self.declare_parameter("dog_id", os.getenv("DOG_ID", "dog"))
 
         self._accumulate_scans = self.get_parameter("accumulate_scans").value
         # 0 is a sentinel for "same as accumulate_scans" (the original,
@@ -391,6 +407,9 @@ class OnlinePerceptionNode(Node):
         self._range_image_tolerance = self.get_parameter("range_image_tolerance").value
         self._z_max = self.get_parameter("z_max").value
         self._frame_id = self.get_parameter("frame_id").value
+        self._dog_id = self.get_parameter("dog_id").value
+        if not self._dog_id:
+            raise ValueError("dog_id must be a non-empty string")
 
         self._max_missed_frames = self.get_parameter("max_missed_frames").value
         self._max_missed_seconds = self.get_parameter("max_missed_seconds").value
@@ -414,6 +433,10 @@ class OnlinePerceptionNode(Node):
         self._prev_frame_stamp = None
         self._prev_frame_position = None   # sensor position (m) at that frame, for the visibility gate
         self._frame_count = 0
+        # Local track IDs and frame sequence numbers restart with this node.
+        # A boot/session identifier lets a peer distinguish that legitimate
+        # reset from a delayed UDP datagram from the previous process.
+        self._session_id = str(uuid.uuid4())
         self._scan_count = 0
         self._latest_odom = None
         self._logged_missing_odom_warning = False
@@ -428,6 +451,8 @@ class OnlinePerceptionNode(Node):
             MarkerArray, "/online_perception/markers", 10)
         self._tracks_pub = self.create_publisher(
             PoseArray, "/online_perception/tracks", 10)
+        self._track_observations_pub = self.create_publisher(
+            String, "/online_perception/track_observations", 10)
 
         self.get_logger().info(
             f"online_perception_node ready -- accumulating "
@@ -526,7 +551,7 @@ class OnlinePerceptionNode(Node):
         clusters, n_implausible = self._drop_implausible_clusters(clusters)
 
         dt = stamp - self._prev_frame_stamp if self._prev_frame_stamp is not None else 0.0
-        self._update_tracks(clusters, dt)
+        self._update_tracks(clusters, dt, stamp)
 
         processing_s = time.perf_counter() - processing_start
         self._log_frame_timing(processing_s, dt)
@@ -625,13 +650,14 @@ class OnlinePerceptionNode(Node):
                 f"mean {samples.mean() * 1000:.1f}ms, "
                 f"max {samples.max() * 1000:.1f}ms")
 
-    def _update_tracks(self, clusters, dt) -> None:
+    def _update_tracks(self, clusters, dt, stamp) -> None:
         active_tracks = self._tracker.step(clusters, dt)
 
         markers = MarkerArray()
         tracks = PoseArray()
         tracks.header.frame_id = self._frame_id
         tracks.header.stamp = self.get_clock().now().to_msg()
+        rich_tracks = []
         for track_id, info in active_tracks.items():
             # Tentative tracks (fewer than min_hits real detections) are
             # tracked internally so they have a chance to become confirmed,
@@ -668,6 +694,13 @@ class OnlinePerceptionNode(Node):
                 pose.position.z = float(track.position[2])
                 pose.orientation.w = 1.0
                 tracks.poses.append(pose)
+                rich_tracks.append({
+                    "local_id": track_id,
+                    "position_m": track.position.tolist(),
+                    "velocity_m_s": track.velocity.tolist(),
+                    "size_m": track.size.tolist(),
+                    "n_points": track.n_points,
+                })
 
         if markers.markers:
             self._marker_pub.publish(markers)
@@ -675,6 +708,22 @@ class OnlinePerceptionNode(Node):
         # observation rather than having to guess whether silence means no
         # tracks or a dead perception node.
         self._tracks_pub.publish(tracks)
+        sensor_position = self._odom_position()
+        packet = {
+            "schema_version": 1,
+            "source_id": self._dog_id,
+            "session_id": self._session_id,
+            "sequence": self._frame_count,
+            "stamp_s": stamp,
+            "frame_id": self._frame_id,
+            "sensor_position_m": (
+                sensor_position.tolist()
+                if sensor_position is not None else [0.0, 0.0, 0.0]
+            ),
+            "tracks": rich_tracks,
+        }
+        self._track_observations_pub.publish(
+            String(data=json.dumps(packet, separators=(",", ":"))))
 
     def _build_markers(self, track_id, track, speed, is_coasting, is_reidentified):
         colour = _track_colour(track_id)

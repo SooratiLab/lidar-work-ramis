@@ -61,9 +61,9 @@ each subdirectory's README for exactly what has and hasn't been tested.
   baseline still survive. An overlapping-frame architecture was
   investigated as a latency improvement and rejected with data, and a
   stage-by-stage performance profile found no library swap currently
-  justified -- this is the current priority: a solid single-LiDAR
-  implementation, tested and documented against recorded bags, before
-  live hardware testing or multi-dog merging. See `perception/README.md`
+  justified. Single-LiDAR live hardware validation remains the priority;
+  the multi-dog code below deliberately builds on this output rather than
+  bypassing its remaining physical tests. See `perception/README.md`
   for the full writeup, including what's confirmed vs still open -- most
   notably, this is all validated against recorded bags standing in for a
   live sensor, not an actual moving dog yet.
@@ -93,7 +93,15 @@ each subdirectory's README for exactly what has and hasn't been tested.
   track-level analogue of ICP-with-prior), searches for a frame-index
   lag between the two dogs' independently-exported sessions, and fuses
   corresponded tracks while keeping single-dog-only tracks rather than
-  dropping them. Validated against the one two-dog session currently
+  dropping them. An opt-in live proof of concept now exchanges only compact,
+  authenticated rich-track snapshots over unicast UDP (leaving DDS and raw
+  LiDAR restricted to each dog's wired interface), matches position and
+  velocity after configured shared-frame transforms, and publishes a local
+  shared knowledge base. It is informational and cannot feed actuation. The
+  association core has been replayed against the existing two-dog CSVs, but
+  the network path and identity quality have not yet been tested
+  simultaneously on physical dogs. Offline fusion is validated against the
+  one two-dog session currently
   exported (`2026-05-12_fallback_cardbox1`, the cardboard-box
   complementary-coverage demo from Kei's handover): recovers a plausible
   calibration from an identity prior and produces one continuous fused

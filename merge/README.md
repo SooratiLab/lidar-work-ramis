@@ -27,8 +27,117 @@ more semantically meaningful than a raw point.
 ```
 track_fusion.py    core library + CLI: calibrate two dogs' frames against
                    each other, then fuse their tracks
+shared_tracks.py   authenticated packet format + live association/fusion core
+track_exchange_node.py       low-bandwidth peer-to-peer UDP bridge
+shared_track_fusion_node.py   publishes the local shared knowledge base
+replay_shared_tracks.py       feeds offline track CSVs through the live core
 tests/             unit tests against synthetic observations
 ```
+
+## Live two-dog proof of concept
+
+The live path is intentionally separate from the offline calibration above:
+
+```
+dog 1 perception --local JSON--> dog 1 fusion --> /shared_perception/tracks
+       |                              ^
+       +--signed unicast UDP----------+-- dog 2's exchanged JSON
+```
+
+The same path runs in the opposite direction on dog 2. DDS remains restricted
+to each Jetson's `eth0`, as required by the LiDAR and robot network; opening
+DDS discovery over WiFi would also expose high-rate raw point clouds and robot
+topics. `track_exchange_node.py` instead sends only the small rich-track JSON
+to one configured WiFi, access-point, or Tailscale address. HMAC-SHA256 rejects
+accidental or unauthenticated packets, although it does not encrypt contents.
+
+Each observation preserves information the old `PoseArray` boundary cannot
+represent: source/local ID, process-session ID, timestamp, centroid, filtered
+velocity, cluster extent, point count, and coordinate frame. The session ID
+prevents delayed UDP packets from an earlier node process being mistaken for
+the current local IDs after a restart. Both sources are transformed into one
+configured shared frame. Hungarian assignment then minimises position plus
+velocity disagreement, with a 2 m position gate; two time-aligned observation
+pairs must agree before IDs are associated. Objects seen by only one dog stay
+in the knowledge base.
+
+This makes moving clusters useful, but not uniquely identifiable. In a sparse
+scene, position, velocity, rough extent, and repeated agreement are likely
+enough to recognise a shared walker. In a crowd, at a crossing, or when two
+objects follow similar trajectories, geometry can swap identities. There is
+no appearance, semantic class, or person descriptor in LiDAR centroids. Treat
+a shared ID as an association to evaluate, not ground truth.
+
+The shared topic is **informational only**. It is not subscribed to by the
+response or actuation nodes; neither dog can stop or move because of a remote
+packet in this proof of concept.
+
+### Configuration
+
+Choose one physical shared frame, normally dog 1's FastLIO frame, and measure
+the other sensor frame relative to it. The transform syntax is
+`x_m,y_m,z_m,yaw_deg`. Both Jetson clocks must be synchronised (NTP/chrony);
+the default matcher rejects snapshots more than 1.5 s apart, but a permissive
+gate cannot repair incorrectly timestamped data.
+
+On dog 1:
+
+```dotenv
+DOG_ID=dog1
+PEER_DOG_ID=dog2
+TRACK_EXCHANGE_ENABLED=true
+TRACK_PEER_HOST=<dog-2-wireless-ip>
+TRACK_SHARED_SECRET=<same-random-secret-on-both-dogs>
+LOCAL_TO_SHARED=0,0,0,0
+REMOTE_TO_SHARED=<measured-dog2-to-dog1-transform>
+```
+
+On dog 2, reverse local/remote while retaining dog 1's shared frame:
+
+```dotenv
+DOG_ID=dog2
+PEER_DOG_ID=dog1
+TRACK_EXCHANGE_ENABLED=true
+TRACK_PEER_HOST=<dog-1-wireless-ip>
+TRACK_SHARED_SECRET=<same-random-secret-on-both-dogs>
+LOCAL_TO_SHARED=<measured-dog2-to-dog1-transform>
+REMOTE_TO_SHARED=0,0,0,0
+```
+
+Keep the secret in each ignored `docker/.env`, never in a commit. Start the
+normal hardware path and opt-in shared services together:
+
+```bash
+cd docker
+docker compose --profile hardware --profile shared up
+```
+
+Inspect `/shared_perception/tracks` independently on each dog. The snapshots
+need not be byte-identical at every instant because arrival is asynchronous,
+but stable associations and positions should agree.
+
+### Recorded-data smoke test
+
+This bypasses ROS and networking but sends the existing real two-dog track
+logs through exactly the live association core:
+
+```bash
+python3 merge/replay_shared_tracks.py \
+  output/2026-05-12_fallback_dog1/2026-05-12_fallback_dog1_tracks.csv \
+  output/2026-05-12_fallback_dog2/2026-05-12_fallback_dog2_tracks.csv \
+  --dog2-to-dog1 2.26,-0.11,0.13,-5.5 \
+  --dog2-time-offset 1
+```
+
+With the transform and frame lag recovered by offline calibration, this
+processed 90 packets and produced shared associations in 28 snapshots. It
+also exposed an important limitation: five distinct ID pairs appeared, but
+one dog-1 track associated with two successive dog-2 IDs, while one offline
+correspondence was absent. Some of that can be legitimate remote track
+fragmentation; without labelled ground truth it must not be claimed as
+correct re-identification. The CSV also lacks cluster extents and velocity
+vectors, so replay estimates velocity from centroids and cannot reproduce the
+richer live input exactly.
 
 ## How it works
 
@@ -179,8 +288,8 @@ have both dogs seeing the same thing.
   across 5 track pairs). A session with more sustained double-coverage
   would be a better test of calibration stability specifically.
 - **No NTP/clock-sync investigation done here.** Frame-index lag search is
-  a coarse stand-in
-  for real clock synchronisation, tolerant of the "~100ms drift at
+  a coarse stand-in for real clock synchronisation, tolerant of the
+  "~100ms drift at
   1-second frames" Kei's handover calls tolerable, but not a substitute
   for actually checking it if frame duration ever shrinks for a realtime
   version of this.
@@ -223,8 +332,8 @@ success path.
   nothing (see its docstring). A one-time deployment measurement or a
   shared landmark is the intended source for that prior; this module
   consumes it once available, not a replacement for measuring it.
-- **No live/realtime version.** This runs against already-exported
-  sessions, the same way `evaluation/` does, for the same reason: it's
-  the fastest way to validate the actual fusion logic against real data
-  before building anything that needs two live dogs and a real-time
-  correspondence step running simultaneously.
+- **Live exchange has not run on two physical dogs.** The packet,
+  authentication, transform, association, timeout, and replay paths are
+  implemented and tested, but WiFi loss, clock agreement, measured
+  deployment transforms, and identity quality still need a simultaneous
+  two-dog experiment.

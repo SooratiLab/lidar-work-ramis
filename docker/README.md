@@ -18,7 +18,7 @@ this), see the repo's internal notes for what's still open.
 Dockerfile                        image build: Livox-SDK2 + colcon workspace
 entrypoint.sh                     renders per-dog LiDAR config, dispatches launch
 patch_livox_timestamp.py          LiDAR/IMU timestamp fix, applied at build time
-docker-compose.yml                sensor, perception, response, actuation, replay, export services
+docker-compose.yml                sensor, perception, response, actuation, replay, export, shared services
 .env.example                      copy to .env, set LIVOX_LIDAR_IP (and BAG_PATH for replay/export)
 config/
   MID360_config.json.template     driver config with ${LIVOX_LIDAR_IP} etc.
@@ -26,7 +26,7 @@ config/
   fastrtps_eth0_only.xml           Fast DDS fallback multicast whitelist
 ```
 
-`docker-compose.yml` has three profiles:
+`docker-compose.yml` has four profiles:
 
 - **`hardware`** -- `driver` + `fastlio` + `perception` + `response` +
   `actuation`, for a real Mid-360 plugged into this Jetson. Actuation is a
@@ -37,6 +37,10 @@ config/
 - **`export`** -- `fastlio` + `bag` + `export`, for turning a bag into the
   `pcd/` + `poses.csv` layout `../evaluation/` expects, without a live
   ROS graph to watch or a separate node to run. See `../export/README.md`.
+- **`shared`** -- the opt-in authenticated UDP track bridge and local
+  two-source fusion node. Run it alongside `hardware` after configuring
+  both dogs; it does not start a sensor or perception by itself. See
+  `../merge/README.md`.
 
 Every service needs a profile flag -- there is no profile-less default
 service in this file, so a bare `docker compose build`/`up` matches nothing

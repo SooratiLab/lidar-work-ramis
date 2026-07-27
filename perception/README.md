@@ -36,7 +36,7 @@ changed and why.
 
 ## Output and basic response
 
-`online_perception_node.py` publishes two views of each confirmed track:
+`online_perception_node.py` publishes three views of each confirmed track:
 
 - `/online_perception/markers` (`visualization_msgs/MarkerArray`) for RViz.
 - `/online_perception/tracks` (`geometry_msgs/PoseArray`) as the
@@ -45,6 +45,16 @@ changed and why.
   predictions are excluded: a predicted position with no current
   measurement is useful for display and identity continuity, but is not
   strong enough evidence to trigger a robot response.
+- `/online_perception/track_observations` (`std_msgs/String` containing
+  JSON) for the optional inter-dog prototype. It preserves the local track
+  ID, filtered velocity, cluster extent, point count, source timestamp,
+  sensor position, frame name, and unique `DOG_ID`; coasted predictions are
+  excluded. See `../merge/README.md` for the signed low-bandwidth exchange
+  and shared-frame matching path.
+
+Adding the rich JSON publisher does not change the existing MarkerArray or
+PoseArray contents. The response policy still consumes only the local
+PoseArray, so remote/shared tracks cannot affect actuation.
 
 `cluster_response_node.py` measures those track positions from the current
 FastLIO `/Odometry` position. A track within `stop_distance` (2.0 m by

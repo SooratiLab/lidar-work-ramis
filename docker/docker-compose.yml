@@ -80,7 +80,9 @@ services:
     image: go2-lidar-humble:latest
     container_name: go2-online-perception
     network_mode: host
-    environment: *dds-environment
+    environment:
+      <<: *dds-environment
+      DOG_ID: ${DOG_ID:-dog}
     volumes:
       - ../perception:/opt/perception:ro
     command: ["python3", "/opt/perception/online_perception_node.py"]
@@ -124,6 +126,42 @@ services:
     profiles: ["hardware", "replay"]
     depends_on:
       - response
+
+  # Optional low-bandwidth inter-dog prototype. DDS stays on each dog's
+  # eth0; only authenticated track JSON is sent explicitly over UDP to the
+  # configured WiFi/Tailscale peer. Start alongside hardware with both
+  # `--profile hardware --profile shared`; it is not part of the default
+  # single-dog path.
+  track-exchange:
+    image: go2-lidar-humble:latest
+    container_name: go2-track-exchange
+    network_mode: host
+    environment:
+      <<: *dds-environment
+      DOG_ID: ${DOG_ID:-dog}
+      TRACK_EXCHANGE_ENABLED: ${TRACK_EXCHANGE_ENABLED:-false}
+      TRACK_PEER_HOST: ${TRACK_PEER_HOST:-}
+      TRACK_EXCHANGE_PORT: ${TRACK_EXCHANGE_PORT:-47020}
+      TRACK_SHARED_SECRET: ${TRACK_SHARED_SECRET:-}
+    volumes:
+      - ../merge:/opt/merge:ro
+    command: ["python3", "/opt/merge/track_exchange_node.py"]
+    profiles: ["shared"]
+
+  shared-fusion:
+    image: go2-lidar-humble:latest
+    container_name: go2-shared-track-fusion
+    network_mode: host
+    environment:
+      <<: *dds-environment
+      DOG_ID: ${DOG_ID:-dog}
+      PEER_DOG_ID: ${PEER_DOG_ID:-peer}
+      LOCAL_TO_SHARED: ${LOCAL_TO_SHARED:-0,0,0,0}
+      REMOTE_TO_SHARED: ${REMOTE_TO_SHARED:-0,0,0,0}
+    volumes:
+      - ../merge:/opt/merge:ro
+    command: ["python3", "/opt/merge/shared_track_fusion_node.py"]
+    profiles: ["shared"]
 
   # Batch bag -> PCD/poses export -- the one-command replacement for Kei's
   # original WSL2/Jazzy/export_fastlio.py workflow (kei-stuff/ros2-go2/
