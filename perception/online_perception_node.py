@@ -293,6 +293,23 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  gap completion. The normal
                                                  nearest-neighbour detector is
                                                  unchanged when false.
+    use_free_space_detection (bool, default False) Dynablox-inspired
+                                                 experimental alternative
+                                                 that adds a sparse,
+                                                 conservatively established
+                                                 free-space voxel map as a
+                                                 temporal gate on the normal
+                                                 nearest-neighbour and
+                                                 visibility detector. This is
+                                                 an adaptation,
+                                                 not the upstream TSDF/Voxblox
+                                                 implementation. It requires
+                                                 one scan per frame and
+                                                 odometry. It is mutually
+                                                 exclusive with occlusion
+                                                 accumulation and leaves the
+                                                 normal detector unchanged
+                                                 when false.
     kalman_position_std   (float, default 0.1)   assumed centroid
                                                  measurement noise (m) --
                                                  how much a single DBSCAN
@@ -364,6 +381,7 @@ from pointcloud import pointcloud2_to_xyz, voxel_downsample
 from tracking import CentroidTracker, cluster_moved_points, filter_plausible_detections
 from range_image import build_range_image, previously_visible_mask
 from occlusion_accumulation import OcclusionAccumulator
+from free_space import EverFreeDetector
 
 
 def _track_colour(track_id: int) -> tuple:
@@ -403,6 +421,16 @@ class OnlinePerceptionNode(Node):
         self.declare_parameter("range_image_tolerance", 0.3)
         self.declare_parameter("range_image_tolerance_ratio", 0.0)
         self.declare_parameter("use_occlusion_accumulation", False)
+        self.declare_parameter("use_free_space_detection", False)
+        self.declare_parameter("free_space_voxel_size", 0.20)
+        self.declare_parameter("free_space_min_range", 0.5)
+        self.declare_parameter("free_space_max_range", 20.0)
+        self.declare_parameter("free_space_burn_in_observations", 5)
+        self.declare_parameter("free_space_temporal_buffer_frames", 2)
+        self.declare_parameter("free_space_reset_after_occupied_frames", 150)
+        self.declare_parameter("free_space_neighbor_connectivity", 6)
+        self.declare_parameter("free_space_ray_step_ratio", 0.75)
+        self.declare_parameter("free_space_surface_margin_voxels", 1.0)
         self.declare_parameter("kalman_position_std", 0.1)
         self.declare_parameter("kalman_velocity_std", 2.0)
         self.declare_parameter("kalman_process_std", 1.0)
@@ -429,16 +457,29 @@ class OnlinePerceptionNode(Node):
             "range_image_tolerance_ratio").value
         self._use_occlusion_accumulation = self.get_parameter(
             "use_occlusion_accumulation").value
+        self._use_free_space_detection = self.get_parameter(
+            "use_free_space_detection").value
         self._z_max = self.get_parameter("z_max").value
         self._frame_id = self.get_parameter("frame_id").value
         self._dog_id = self.get_parameter("dog_id").value
         if not self._dog_id:
             raise ValueError("dog_id must be a non-empty string")
-        if self._use_occlusion_accumulation and (
-            self._accumulate_scans != 1 or self._accumulate_stride != 1
+        if (
+            self._use_occlusion_accumulation
+            and self._use_free_space_detection
         ):
             raise ValueError(
-                "experimental occlusion accumulation requires "
+                "occlusion accumulation and free-space detection are "
+                "mutually exclusive")
+        if (
+            (self._use_occlusion_accumulation
+             or self._use_free_space_detection)
+            and (
+            self._accumulate_scans != 1 or self._accumulate_stride != 1
+            )
+        ):
+            raise ValueError(
+                "experimental temporal detectors require "
                 "accumulate_scans=1 and accumulate_stride=1")
 
         self._max_missed_frames = self.get_parameter("max_missed_frames").value
@@ -468,6 +509,29 @@ class OnlinePerceptionNode(Node):
         self._occlusion_accumulator = (
             OcclusionAccumulator(max_gap_bins=0)
             if self._use_occlusion_accumulation else None
+        )
+        self._free_space_detector = (
+            EverFreeDetector(
+                voxel_size=self.get_parameter(
+                    "free_space_voxel_size").value,
+                min_range=self.get_parameter(
+                    "free_space_min_range").value,
+                max_range=self.get_parameter(
+                    "free_space_max_range").value,
+                burn_in_observations=self.get_parameter(
+                    "free_space_burn_in_observations").value,
+                temporal_buffer_frames=self.get_parameter(
+                    "free_space_temporal_buffer_frames").value,
+                reset_after_occupied_frames=self.get_parameter(
+                    "free_space_reset_after_occupied_frames").value,
+                neighbor_connectivity=self.get_parameter(
+                    "free_space_neighbor_connectivity").value,
+                ray_step_ratio=self.get_parameter(
+                    "free_space_ray_step_ratio").value,
+                surface_margin_voxels=self.get_parameter(
+                    "free_space_surface_margin_voxels").value,
+            )
+            if self._use_free_space_detection else None
         )
         self._frame_count = 0
         # Local track IDs and frame sequence numbers restart with this node.
@@ -503,7 +567,9 @@ class OnlinePerceptionNode(Node):
             f"max_sensor_range={self._max_sensor_range}, "
             f"use_visibility_gate={self._use_visibility_gate}, "
             f"use_occlusion_accumulation="
-            f"{self._use_occlusion_accumulation})")
+            f"{self._use_occlusion_accumulation}, "
+            f"use_free_space_detection="
+            f"{self._use_free_space_detection})")
 
     def _odom_cb(self, msg: Odometry) -> None:
         self._latest_odom = msg
@@ -574,6 +640,11 @@ class OnlinePerceptionNode(Node):
                 and frame_position is not None
             ):
                 self._occlusion_accumulator.update(frame, frame_position)
+            if (
+                self._free_space_detector is not None
+                and frame_position is not None
+            ):
+                self._free_space_detector.update(frame, frame_position)
             self._prev_frame = frame
             self._prev_frame_stamp = stamp
             self._prev_frame_position = frame_position
@@ -602,6 +673,32 @@ class OnlinePerceptionNode(Node):
                     frame, frame_position)
                 moved = result.moved_points
             n_unseen = 0
+        elif self._free_space_detector is not None:
+            if frame_position is None:
+                if not self._logged_missing_odom_for_visibility_warning:
+                    self.get_logger().warning(
+                        "no /Odometry received yet -- experimental "
+                        "free-space detector cannot update")
+                    self._logged_missing_odom_for_visibility_warning = True
+                self._free_space_detector.reset()
+                moved = np.empty((0, 3))
+            else:
+                if (
+                    self._prev_frame_stamp is not None
+                    and stamp < self._prev_frame_stamp
+                ):
+                    self._free_space_detector.reset()
+                result = self._free_space_detector.update(
+                    frame, frame_position)
+                moved = result.moved_points
+                if len(moved):
+                    tree = cKDTree(self._prev_frame)
+                    distances, _ = tree.query(moved, k=1)
+                    moved = moved[
+                        distances > self._change_threshold]
+                moved, n_unseen = self._apply_visibility_gate(moved)
+            if frame_position is None:
+                n_unseen = 0
         else:
             # Points far from the previous frame are candidate motion, then
             # checked against what that previous viewpoint could see.

@@ -151,3 +151,75 @@ def test_occlusion_pipeline_requires_pose_for_every_frame(tmp_path):
             session_dir,
             PipelineParams(use_occlusion_accumulation=True),
         )
+
+
+def test_run_pipeline_can_use_experimental_free_space_detection(tmp_path):
+    # Repeated background returns establish the ray volume in front of a
+    # wall as free. A compact object then enters that volume in two
+    # successive frames, providing the two measurements needed to confirm
+    # a track.
+    background = _cluster_mm((3000.0, 0.0, 0.0), n_side=7)
+    frames_mm = [
+        background,
+        background,
+        np.concatenate([
+            background,
+            _cluster_mm((2000.0, 0.0, 0.0)),
+        ]),
+        np.concatenate([
+            background,
+            _cluster_mm((1600.0, 0.0, 0.0)),
+        ]),
+    ]
+    session_dir = _write_session(
+        tmp_path, frames_mm, frame_timestamps=[0.0, 0.1, 0.2, 0.3])
+
+    track_rows, frame_summaries = run_pipeline(
+        session_dir,
+        PipelineParams(
+            use_free_space_detection=True,
+            cluster_min_points=5,
+            free_space_burn_in_observations=2,
+            free_space_neighbor_connectivity=0,
+        ),
+    )
+
+    assert "free_space" in frame_summaries[1]
+    assert frame_summaries[1]["free_space"]["ever_free_voxels"] > 0
+    assert len(frame_summaries[2]["moved"]) >= 5
+    assert any(row["frame"] == 3 for row in track_rows)
+
+
+def test_free_space_pipeline_requires_pose_for_every_frame(tmp_path):
+    session_dir = _write_session(
+        tmp_path,
+        [_BACKGROUND_MM, _BACKGROUND_MM],
+        frame_timestamps=[0.0, 1.0],
+    )
+    with open(session_dir / "poses.csv", "w", newline="") as handle:
+        csv.writer(handle).writerow(
+            ["frame", "timestamp", "x", "y", "z", "qx", "qy", "qz", "qw"])
+
+    with np.testing.assert_raises_regex(
+        ValueError, "requires an odometry pose"):
+        run_pipeline(
+            session_dir,
+            PipelineParams(use_free_space_detection=True),
+        )
+
+
+def test_experimental_detectors_are_mutually_exclusive(tmp_path):
+    session_dir = _write_session(
+        tmp_path,
+        [_BACKGROUND_MM, _BACKGROUND_MM],
+        frame_timestamps=[0.0, 1.0],
+    )
+
+    with np.testing.assert_raises_regex(ValueError, "mutually exclusive"):
+        run_pipeline(
+            session_dir,
+            PipelineParams(
+                use_occlusion_accumulation=True,
+                use_free_space_detection=True,
+            ),
+        )

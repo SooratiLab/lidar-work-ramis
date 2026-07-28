@@ -42,6 +42,7 @@ from pointcloud import voxel_downsample
 from tracking import CentroidTracker, cluster_moved_points, filter_plausible_detections
 from range_image import build_range_image, previously_visible_mask
 from occlusion_accumulation import OcclusionAccumulator
+from free_space import EverFreeDetector
 
 
 @dataclass
@@ -87,6 +88,18 @@ class PipelineParams:
     occlusion_activation_threshold: float = 0.30
     occlusion_activation_range_ratio: float = 0.30
     occlusion_point_depth_tolerance: float = 0.50
+    # Experimental Dynablox-inspired alternative. This is a sparse ray map,
+    # not the upstream TSDF/Voxblox implementation. It remains off by default.
+    use_free_space_detection: bool = False
+    free_space_voxel_size: float = 0.20
+    free_space_min_range: float = 0.5
+    free_space_max_range: float = 20.0
+    free_space_burn_in_observations: int = 5
+    free_space_temporal_buffer_frames: int = 2
+    free_space_reset_after_occupied_frames: int = 150
+    free_space_neighbor_connectivity: int = 6
+    free_space_ray_step_ratio: float = 0.75
+    free_space_surface_margin_voxels: float = 1.0
 
 
 def load_frame_poses(poses_csv: Path):
@@ -147,6 +160,14 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
         reid_max_distance=params.reid_max_distance,
         reid_window_seconds=params.reid_window_seconds,
     )
+    if (
+        params.use_occlusion_accumulation
+        and params.use_free_space_detection
+    ):
+        raise ValueError(
+            "occlusion accumulation and free-space detection are "
+            "mutually exclusive")
+
     occlusion_accumulator = None
     if params.use_occlusion_accumulation:
         occlusion_accumulator = OcclusionAccumulator(
@@ -161,6 +182,24 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
             activation_threshold=params.occlusion_activation_threshold,
             activation_range_ratio=params.occlusion_activation_range_ratio,
             point_depth_tolerance=params.occlusion_point_depth_tolerance,
+        )
+    free_space_detector = None
+    if params.use_free_space_detection:
+        free_space_detector = EverFreeDetector(
+            voxel_size=params.free_space_voxel_size,
+            min_range=params.free_space_min_range,
+            max_range=params.free_space_max_range,
+            burn_in_observations=(
+                params.free_space_burn_in_observations),
+            temporal_buffer_frames=(
+                params.free_space_temporal_buffer_frames),
+            reset_after_occupied_frames=(
+                params.free_space_reset_after_occupied_frames),
+            neighbor_connectivity=(
+                params.free_space_neighbor_connectivity),
+            ray_step_ratio=params.free_space_ray_step_ratio,
+            surface_margin_voxels=(
+                params.free_space_surface_margin_voxels),
         )
 
     prev_frame = prev_stamp = prev_position = None
@@ -186,6 +225,12 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
                         "occlusion accumulation requires an odometry pose "
                         f"for every frame; frame {frame_idx} has none")
                 occlusion_accumulator.update(points_m, frame_position)
+            if free_space_detector is not None:
+                if frame_position is None:
+                    raise ValueError(
+                        "free-space detection requires an odometry pose "
+                        f"for every frame; frame {frame_idx} has none")
+                free_space_detector.update(points_m, frame_position)
             frame_summaries.append({
                 "frame": frame_idx,
                 "points": points_m,
@@ -208,6 +253,49 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
                 "positive_bins": result.n_positive_bins,
                 "reappeared_bins": result.n_reappeared_bins,
                 "active_bins": result.n_active_bins,
+            }
+        elif free_space_detector is not None:
+            if frame_position is None:
+                raise ValueError(
+                    "free-space detection requires an odometry pose "
+                    f"for every frame; frame {frame_idx} has none")
+            if prev_stamp is not None and frame_stamp < prev_stamp:
+                free_space_detector.reset()
+            result = free_space_detector.update(points_m, frame_position)
+            # The sparse ray map lacks Dynablox's fused TSDF surface model.
+            # Use it as a long-term gate on this project's established
+            # short-term detector; standalone intrusion candidates otherwise
+            # include too many static surface-boundary points on Mid-360 data.
+            moved = result.moved_points
+            if len(moved):
+                tree = cKDTree(prev_frame)
+                distances, _ = tree.query(moved, k=1)
+                moved = moved[distances > params.change_threshold]
+            if (
+                params.use_visibility_gate
+                and len(moved) > 0
+                and prev_position is not None
+            ):
+                prev_range_image = build_range_image(
+                    prev_frame,
+                    prev_position,
+                    params.range_image_azimuth_bins,
+                    params.range_image_elevation_bins,
+                )
+                keep = previously_visible_mask(
+                    moved,
+                    prev_position,
+                    prev_range_image,
+                    params.range_image_azimuth_bins,
+                    params.range_image_elevation_bins,
+                    params.range_image_tolerance,
+                    params.range_image_tolerance_ratio,
+                )
+                moved = moved[keep]
+            free_space_diagnostics = {
+                "ray_voxels": result.n_free_ray_voxels,
+                "ever_free_voxels": result.n_ever_free_voxels,
+                "reset_voxels": result.n_reset_voxels,
             }
         else:
             tree = cKDTree(prev_frame)
@@ -257,6 +345,8 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
         }
         if occlusion_diagnostics is not None:
             frame_summary["occlusion"] = occlusion_diagnostics
+        if free_space_detector is not None:
+            frame_summary["free_space"] = free_space_diagnostics
         frame_summaries.append(frame_summary)
         prev_frame, prev_stamp, prev_position = points_m, frame_stamp, frame_position
 

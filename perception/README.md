@@ -29,6 +29,11 @@ changed and why.
   the offline A/B evaluator, not the live node; see
   `../evaluation/README.md` for the mixed initial result and
   `../CITATIONS.md` for technical attribution.
+- `free_space.py` -- experimental sparse free-space history adapted from
+  Dynablox's central motion cue. Repeated pose-aligned rays establish
+  trustworthy free voxels; the established detector can then reject candidates
+  that did not enter that space. This is a lightweight Python adaptation, not
+  Dynablox's TSDF/Voxblox implementation.
 - `cluster_response_node.py` / `response_policy.py` -- convert confirmed,
   current tracks into a time-debounced stop request, with stale-input
   handling. The ROS node publishes the request and status; the plain-numpy
@@ -344,6 +349,51 @@ Start with:
 
 ```text
 -p use_occlusion_accumulation:=true
+-p accumulate_scans:=1
+-p accumulate_stride:=1
+-p cluster_min_points:=5
+```
+
+### Experimental free-space history
+
+`use_free_space_detection` defaults to `False`. When enabled, it keeps the
+established nearest-neighbour difference and visibility gate, then adds a
+longer-term test adapted from Dynablox: a candidate must occupy a voxel that
+repeated earlier rays established as free. Unknown space never activates;
+spatially supported free evidence needs five observations by default; and
+persistent occupancy clears stale free labels so odometry drift or a genuine
+static-scene change does not poison the map permanently.
+
+This is deliberately an adaptation rather than a port of the cloned Dynablox
+repository. Dynablox uses ROS 1, Voxblox, and a fused TSDF; this project keeps a
+sparse Python ray/voxel map so the idea can be screened inside the existing
+ROS 2 and offline pipelines without adding a second mapping stack. The missing
+TSDF surface model matters: using sparse free-space intrusion as a standalone
+detector produced many static-boundary tracks, so the implemented mode uses it
+only as an additional gate on the working detector.
+
+The mode requires `accumulate_scans=1`, `accumulate_stride=1`, and odometry.
+It is mutually exclusive with `use_occlusion_accumulation`. A controlled run
+on the 242-scan `soton_indoor_dog1_scan1` export produced:
+
+| metric | established | established + free-space gate |
+|---|---:|---:|
+| moved points | 7,514 | 3,696 |
+| confirmed tracks | 1 | 1 |
+| measured rows on that track | 4 | 4 |
+| first confirmed frame | 90 | 90 |
+| mean runtime per frame | 2.5 ms | 49.4 ms |
+
+The same known trajectory survives and candidate points roughly halve, but no
+track-level benefit is demonstrated and runtime is substantially higher. Keep
+the mode disconnected from actuation and default-off until labelled
+no-person, walking, crossing, and moving-dog recordings show whether the
+discarded candidates are false positives rather than useful object support.
+
+Start a live screening run with:
+
+```text
+-p use_free_space_detection:=true
 -p accumulate_scans:=1
 -p accumulate_stride:=1
 -p cluster_min_points:=5

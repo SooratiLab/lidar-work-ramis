@@ -79,11 +79,14 @@ each subdirectory's README for exactly what has and hasn't been tested.
   and false-positive-reduction numbers above as concrete artifacts instead
   of log excerpts. It also contains an opt-in A/B evaluator for an
   experimental temporal range-image occlusion accumulator adapted from Kim
-  et al. (2025), plus an A/B test for range-adaptive visibility tolerance.
+  et al. (2025), a Dynablox-inspired sparse free-space history gate, plus an
+  A/B test for range-adaptive visibility tolerance.
   Aggregate-frame results remain negative, while a one-scan export found one
-  promising persistent trajectory from the lightweight accumulator. A guarded,
-  default-off live mode now exists for physical testing only; it refuses the
-  invalid ten-scan configuration. See `evaluation/README.md`.
+  promising persistent trajectory from the lightweight accumulator. The
+  free-space gate preserved that export's known baseline trajectory and halved
+  moved candidates, but added substantial runtime and no track-level benefit.
+  Guarded, default-off live modes exist for physical testing only and refuse
+  invalid ten-scan configurations. See `evaluation/README.md`.
 - **`export/`** -- ports Kei's `export_fastlio.py` (originally a manual
   step in a three-terminal WSL2/Jazzy workflow, see
   `kei-stuff/ros2-go2/laptop-wsl-setup.md`) into a `docker-compose`

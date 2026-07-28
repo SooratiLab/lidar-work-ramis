@@ -16,6 +16,7 @@ pcd_io.py               binary PCD reader (x/y/z, matching export_fastlio.py's o
 offline_pipeline.py     replays an exported session through perception/tracking.py
 compare_pipelines.py    CLI: run + compare + visualise, one command per session
 compare_occlusion_detector.py  A/B test experimental range-image accumulation
+compare_free_space_detector.py A/B test experimental free-space history gate
 compare_visibility_tolerance.py  A/B test fixed vs range-adaptive visibility
 response_evaluator.py   applies the response policy to tracks + odometry
 tests/                  unit tests for the offline pipeline and response evaluator
@@ -102,6 +103,36 @@ completion. A suitable starting command-line parameter set is:
 Do not connect this mode to actuation during initial tests. Record both the
 normal and experimental track topics against labelled walking, crossing,
 standing, and no-person scenes first.
+
+### Experimental free-space history
+
+`compare_free_space_detector.py` screens a Dynablox-inspired temporal gate
+against the established detector:
+
+```bash
+python3 evaluation/compare_free_space_detector.py \
+    data/2026-05-12_soton_indoor_dog1_scan1
+```
+
+It writes `baseline_tracks.csv`, `free_space_tracks.csv`, and `summary.json`
+under `output/<session>-free-space-comparison/`. The experiment casts rays
+through registered one-scan clouds, promotes repeatedly observed free voxels,
+and requires established moving-point candidates to intrude into that map.
+This is not the cloned Dynablox TSDF/Voxblox stack; see `../CITATIONS.md` and
+`../perception/free_space.py` for the precise relationship.
+
+The 242-frame one-scan `soton_indoor` screening retained the baseline's one
+known trajectory with the same four measured rows and first confirmation at
+frame 90. It reduced moved candidates from 7,514 to 3,696, but increased mean
+runtime from about 2.5 ms to 49.4 ms per frame. This does not justify enabling
+the gate by default: the recording has no point labels, so fewer candidates
+cannot yet be interpreted as better precision, and there was no track-level
+improvement. Use labelled one-scan recordings before tuning the exposed
+voxel, burn-in, reset, neighborhood, or ray parameters.
+
+Do not run this on the existing ten-scan aggregate exports. Their points came
+from several sensor origins, while `poses.csv` supplies only one pose at the
+frame boundary; casting every ray from that pose is physically invalid.
 
 ### Experimental range-adaptive visibility tolerance
 
