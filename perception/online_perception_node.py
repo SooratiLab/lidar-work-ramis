@@ -310,6 +310,23 @@ Parameters (all overridable via --ros-args -p <name>:=<value>):
                                                  accumulation and leaves the
                                                  normal detector unchanged
                                                  when false.
+    use_temporal_consensus (bool, default False) require a current point to
+                                                 exceed change_threshold in
+                                                 a fraction of several
+                                                 historical frames, adapting
+                                                 the sliding-window evidence
+                                                 used by DOF-LIO and PGP-DOR.
+                                                 This can reject a static
+                                                 surface missed by only one
+                                                 irregular Mid-360 scan.
+    temporal_history_frames (int, default 3)      previous registered frames
+                                                 used when temporal consensus
+                                                 is enabled.
+    temporal_min_changed_ratio (float, default 0.5)
+                                                 fraction of available
+                                                 history frames that must vote
+                                                 changed; the required count
+                                                 is rounded up.
     kalman_position_std   (float, default 0.1)   assumed centroid
                                                  measurement noise (m) --
                                                  how much a single DBSCAN
@@ -382,6 +399,7 @@ from tracking import CentroidTracker, cluster_moved_points, filter_plausible_det
 from range_image import build_range_image, previously_visible_mask
 from occlusion_accumulation import OcclusionAccumulator
 from free_space import EverFreeDetector
+from temporal_consensus import changed_in_history_mask
 
 
 def _track_colour(track_id: int) -> tuple:
@@ -420,6 +438,9 @@ class OnlinePerceptionNode(Node):
         self.declare_parameter("range_image_elevation_bins", 36)
         self.declare_parameter("range_image_tolerance", 0.3)
         self.declare_parameter("range_image_tolerance_ratio", 0.0)
+        self.declare_parameter("use_temporal_consensus", False)
+        self.declare_parameter("temporal_history_frames", 3)
+        self.declare_parameter("temporal_min_changed_ratio", 0.5)
         self.declare_parameter("use_occlusion_accumulation", False)
         self.declare_parameter("use_free_space_detection", False)
         self.declare_parameter("free_space_voxel_size", 0.20)
@@ -455,6 +476,12 @@ class OnlinePerceptionNode(Node):
         self._range_image_tolerance = self.get_parameter("range_image_tolerance").value
         self._range_image_tolerance_ratio = self.get_parameter(
             "range_image_tolerance_ratio").value
+        self._use_temporal_consensus = self.get_parameter(
+            "use_temporal_consensus").value
+        self._temporal_history_frames = self.get_parameter(
+            "temporal_history_frames").value
+        self._temporal_min_changed_ratio = self.get_parameter(
+            "temporal_min_changed_ratio").value
         self._use_occlusion_accumulation = self.get_parameter(
             "use_occlusion_accumulation").value
         self._use_free_space_detection = self.get_parameter(
@@ -481,6 +508,17 @@ class OnlinePerceptionNode(Node):
             raise ValueError(
                 "experimental temporal detectors require "
                 "accumulate_scans=1 and accumulate_stride=1")
+        if self._use_temporal_consensus:
+            if self._use_occlusion_accumulation:
+                raise ValueError(
+                    "temporal consensus and occlusion accumulation are "
+                    "mutually exclusive")
+            if self._temporal_history_frames < 2:
+                raise ValueError(
+                    "temporal_history_frames must be at least 2")
+            if not 0 < self._temporal_min_changed_ratio <= 1:
+                raise ValueError(
+                    "temporal_min_changed_ratio must be in (0, 1]")
 
         self._max_missed_frames = self.get_parameter("max_missed_frames").value
         self._max_missed_seconds = self.get_parameter("max_missed_seconds").value
@@ -499,6 +537,8 @@ class OnlinePerceptionNode(Node):
         )
 
         self._scan_buffer = deque(maxlen=self._accumulate_scans)
+        self._frame_history = deque(
+            maxlen=self._temporal_history_frames)
         self._scans_since_last_frame = 0
         self._prev_frame = None            # downsampled points, last completed frame
         self._prev_frame_stamp = None
@@ -566,6 +606,7 @@ class OnlinePerceptionNode(Node):
             f"reid_window_seconds={self._reid_window_seconds}, "
             f"max_sensor_range={self._max_sensor_range}, "
             f"use_visibility_gate={self._use_visibility_gate}, "
+            f"use_temporal_consensus={self._use_temporal_consensus}, "
             f"use_occlusion_accumulation="
             f"{self._use_occlusion_accumulation}, "
             f"use_free_space_detection="
@@ -648,11 +689,19 @@ class OnlinePerceptionNode(Node):
             self._prev_frame = frame
             self._prev_frame_stamp = stamp
             self._prev_frame_position = frame_position
+            self._frame_history.append(frame)
             self.get_logger().info(
                 f"frame {self._frame_count}: {len(frame)} pts "
                 f"({self._scan_count} scans so far) -- first frame, "
                 f"nothing to compare against yet")
             return
+
+        if (
+            self._use_temporal_consensus
+            and self._prev_frame_stamp is not None
+            and stamp < self._prev_frame_stamp
+        ):
+            self._frame_history.clear()
 
         if self._occlusion_accumulator is not None:
             if frame_position is None:
@@ -690,21 +739,14 @@ class OnlinePerceptionNode(Node):
                     self._free_space_detector.reset()
                 result = self._free_space_detector.update(
                     frame, frame_position)
-                moved = result.moved_points
-                if len(moved):
-                    tree = cKDTree(self._prev_frame)
-                    distances, _ = tree.query(moved, k=1)
-                    moved = moved[
-                        distances > self._change_threshold]
+                moved = self._changed_points(result.moved_points)
                 moved, n_unseen = self._apply_visibility_gate(moved)
             if frame_position is None:
                 n_unseen = 0
         else:
             # Points far from the previous frame are candidate motion, then
             # checked against what that previous viewpoint could see.
-            tree = cKDTree(self._prev_frame)
-            distances, _ = tree.query(frame, k=1)
-            moved = frame[distances > self._change_threshold]
+            moved = self._changed_points(frame)
             moved, n_unseen = self._apply_visibility_gate(moved)
 
         clusters = cluster_moved_points(moved, self._cluster_eps, self._cluster_min_points)
@@ -725,6 +767,25 @@ class OnlinePerceptionNode(Node):
         self._prev_frame = frame
         self._prev_frame_stamp = stamp
         self._prev_frame_position = frame_position
+        self._frame_history.append(frame)
+
+    def _changed_points(self, points: np.ndarray) -> np.ndarray:
+        """Apply the established one-frame test or opt-in history voting."""
+        if len(points) == 0:
+            return points
+        tree = cKDTree(self._prev_frame)
+        distances, _ = tree.query(points, k=1)
+        candidates = points[distances > self._change_threshold]
+        if self._use_temporal_consensus:
+            result = changed_in_history_mask(
+                candidates,
+                self._frame_history,
+                self._change_threshold,
+                self._temporal_min_changed_ratio,
+            )
+            return candidates[result.changed_mask]
+
+        return candidates
 
     def _apply_visibility_gate(self, moved_points: np.ndarray):
         """

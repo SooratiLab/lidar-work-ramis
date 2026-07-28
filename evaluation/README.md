@@ -17,6 +17,7 @@ offline_pipeline.py     replays an exported session through perception/tracking.
 compare_pipelines.py    CLI: run + compare + visualise, one command per session
 compare_occlusion_detector.py  A/B test experimental range-image accumulation
 compare_free_space_detector.py A/B test experimental free-space history gate
+compare_temporal_consensus.py A/B test multi-frame change consensus
 compare_visibility_tolerance.py  A/B test fixed vs range-adaptive visibility
 response_evaluator.py   applies the response policy to tracks + odometry
 tests/                  unit tests for the offline pipeline and response evaluator
@@ -133,6 +134,38 @@ voxel, burn-in, reset, neighborhood, or ray parameters.
 Do not run this on the existing ten-scan aggregate exports. Their points came
 from several sensor origins, while `poses.csv` supplies only one pose at the
 frame boundary; casting every ray from that pose is physically invalid.
+
+### Experimental multi-frame change consensus
+
+`compare_temporal_consensus.py` adds historical change votes after the
+established previous-frame detector:
+
+```bash
+python3 evaluation/compare_temporal_consensus.py \
+    data/2026-05-12_soton_indoor_dog1 \
+    --history-frames 3 --min-changed-ratio 0.5
+```
+
+It writes `baseline_tracks.csv`, `temporal_consensus_tracks.csv`, and
+`summary.json` under `output/<session>-temporal-consensus/`. Unlike the
+free-space and occlusion experiments, this representation is valid on both
+one-scan and aggregate exports: it compares already registered world-frame
+points and does not reconstruct physical rays from one frame pose.
+
+The default experiment is a 2-of-3 vote. Across `walk_test`,
+`fallback_dog2`, aggregate `soton_indoor`, and one-scan `soton_indoor`, it
+removed 2–12% of established moved candidates. It preserved both known
+aggregate tracks and all four measured rows of the one-scan trajectory, but
+did not consistently reduce track counts. A ratio of 0.67 requires all three
+votes because the required count is rounded up; that removed 18–30% and
+reduced track counts on the noisier sessions, but also reduced the one-scan
+known trajectory from four measurements to two.
+
+These are screening counts, not precision/recall. `walk_test` demonstrates a
+specific caveat: filtering points can split a DBSCAN component, producing one
+additional confirmed track even though the accepted point set is strictly
+smaller. Inspect trajectories and labelled objects before interpreting fewer
+points or tracks as better detection.
 
 ### Experimental range-adaptive visibility tolerance
 

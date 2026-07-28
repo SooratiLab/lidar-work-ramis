@@ -43,6 +43,7 @@ from tracking import CentroidTracker, cluster_moved_points, filter_plausible_det
 from range_image import build_range_image, previously_visible_mask
 from occlusion_accumulation import OcclusionAccumulator
 from free_space import EverFreeDetector
+from temporal_consensus import changed_in_history_mask
 
 
 @dataclass
@@ -72,6 +73,12 @@ class PipelineParams:
     range_image_elevation_bins: int = 36
     range_image_tolerance: float = 0.3
     range_image_tolerance_ratio: float = 0.0
+    # DOF-LIO/PGP-DOR-inspired multi-frame change voting. Disabled by
+    # default; the one-frame established detector remains byte-for-byte
+    # equivalent when false.
+    use_temporal_consensus: bool = False
+    temporal_history_frames: int = 3
+    temporal_min_changed_ratio: float = 0.5
     kalman_position_std: float = 0.1
     kalman_velocity_std: float = 2.0
     kalman_process_std: float = 1.0
@@ -167,6 +174,17 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
         raise ValueError(
             "occlusion accumulation and free-space detection are "
             "mutually exclusive")
+    if params.use_temporal_consensus:
+        if params.use_occlusion_accumulation:
+            raise ValueError(
+                "temporal consensus and occlusion accumulation are "
+                "mutually exclusive")
+        if params.temporal_history_frames < 2:
+            raise ValueError(
+                "temporal_history_frames must be at least 2")
+        if not 0 < params.temporal_min_changed_ratio <= 1:
+            raise ValueError(
+                "temporal_min_changed_ratio must be in (0, 1]")
 
     occlusion_accumulator = None
     if params.use_occlusion_accumulation:
@@ -206,6 +224,7 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
     first_frame_stamp = None
     track_rows = []
     frame_summaries = []
+    frame_history = []
 
     for frame_idx, pcd_path in enumerate(pcd_paths):
         points_m = load_pcd_xyz_mm(pcd_path) / 1000.0
@@ -236,10 +255,18 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
                 "points": points_m,
                 "moved": np.empty((0, 3)),
             })
+            frame_history.append(points_m)
             prev_frame, prev_stamp, prev_position = points_m, frame_stamp, frame_position
             continue
 
         occlusion_diagnostics = None
+        temporal_diagnostics = None
+        if (
+            params.use_temporal_consensus
+            and prev_stamp is not None
+            and frame_stamp < prev_stamp
+        ):
+            frame_history.clear()
         if occlusion_accumulator is not None:
             if frame_position is None:
                 raise ValueError(
@@ -270,7 +297,22 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
             if len(moved):
                 tree = cKDTree(prev_frame)
                 distances, _ = tree.query(moved, k=1)
-                moved = moved[distances > params.change_threshold]
+                moved = moved[
+                    distances > params.change_threshold]
+            if len(moved):
+                if params.use_temporal_consensus:
+                    consensus = changed_in_history_mask(
+                        moved,
+                        frame_history,
+                        params.change_threshold,
+                        params.temporal_min_changed_ratio,
+                    )
+                    moved = moved[consensus.changed_mask]
+                    temporal_diagnostics = {
+                        "histories_used": consensus.histories_used,
+                        "required_changed_histories": (
+                            consensus.required_changed_histories),
+                    }
             if (
                 params.use_visibility_gate
                 and len(moved) > 0
@@ -300,7 +342,21 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
         else:
             tree = cKDTree(prev_frame)
             distances, _ = tree.query(points_m, k=1)
-            moved = points_m[distances > params.change_threshold]
+            moved = points_m[
+                distances > params.change_threshold]
+            if params.use_temporal_consensus:
+                consensus = changed_in_history_mask(
+                    moved,
+                    frame_history,
+                    params.change_threshold,
+                    params.temporal_min_changed_ratio,
+                )
+                moved = moved[consensus.changed_mask]
+                temporal_diagnostics = {
+                    "histories_used": consensus.histories_used,
+                    "required_changed_histories": (
+                        consensus.required_changed_histories),
+                }
 
             if params.use_visibility_gate and len(moved) > 0 and prev_position is not None:
                 prev_range_image = build_range_image(
@@ -347,7 +403,12 @@ def run_pipeline(session_dir: Path, params: PipelineParams = PipelineParams()):
             frame_summary["occlusion"] = occlusion_diagnostics
         if free_space_detector is not None:
             frame_summary["free_space"] = free_space_diagnostics
+        if temporal_diagnostics is not None:
+            frame_summary["temporal_consensus"] = temporal_diagnostics
         frame_summaries.append(frame_summary)
+        frame_history.append(points_m)
+        if len(frame_history) > params.temporal_history_frames:
+            frame_history.pop(0)
         prev_frame, prev_stamp, prev_position = points_m, frame_stamp, frame_position
 
     return track_rows, frame_summaries

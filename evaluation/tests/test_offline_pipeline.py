@@ -223,3 +223,79 @@ def test_experimental_detectors_are_mutually_exclusive(tmp_path):
                 use_free_space_detection=True,
             ),
         )
+
+
+def test_temporal_consensus_rejects_one_frame_sampling_gap(tmp_path):
+    intermittent = _cluster_mm((1000.0, 1000.0, 0.0))
+    frames_mm = [
+        np.concatenate([_BACKGROUND_MM, intermittent]),
+        np.concatenate([_BACKGROUND_MM, intermittent]),
+        _BACKGROUND_MM,
+        np.concatenate([_BACKGROUND_MM, intermittent]),
+    ]
+    session_dir = _write_session(
+        tmp_path, frames_mm, frame_timestamps=[0.0, 1.0, 2.0, 3.0])
+
+    baseline_tracks, baseline_frames = run_pipeline(
+        session_dir, PipelineParams(use_visibility_gate=False))
+    consensus_tracks, consensus_frames = run_pipeline(
+        session_dir,
+        PipelineParams(
+            use_visibility_gate=False,
+            use_temporal_consensus=True,
+            temporal_history_frames=3,
+            temporal_min_changed_ratio=0.5,
+        ),
+    )
+
+    assert len(baseline_frames[3]["moved"]) >= 10
+    assert len(consensus_frames[3]["moved"]) == 0
+    assert baseline_tracks == consensus_tracks == []
+
+
+def test_temporal_consensus_preserves_persistent_motion(tmp_path):
+    frames_mm = [
+        _BACKGROUND_MM,
+        _BACKGROUND_MM,
+        _BACKGROUND_MM,
+        np.concatenate([
+            _BACKGROUND_MM,
+            _cluster_mm((1000.0, 1000.0, 0.0)),
+        ]),
+        np.concatenate([
+            _BACKGROUND_MM,
+            _cluster_mm((1500.0, 1500.0, 0.0)),
+        ]),
+    ]
+    session_dir = _write_session(
+        tmp_path, frames_mm, frame_timestamps=[0, 1, 2, 3, 4])
+
+    track_rows, frame_summaries = run_pipeline(
+        session_dir,
+        PipelineParams(
+            use_visibility_gate=False,
+            use_temporal_consensus=True,
+            temporal_history_frames=3,
+            temporal_min_changed_ratio=0.5,
+        ),
+    )
+
+    assert len(frame_summaries[3]["moved"]) >= 10
+    assert any(row["frame"] == 4 for row in track_rows)
+
+
+def test_temporal_consensus_cannot_wrap_occlusion_accumulator(tmp_path):
+    session_dir = _write_session(
+        tmp_path,
+        [_BACKGROUND_MM, _BACKGROUND_MM],
+        frame_timestamps=[0.0, 1.0],
+    )
+
+    with np.testing.assert_raises_regex(ValueError, "mutually exclusive"):
+        run_pipeline(
+            session_dir,
+            PipelineParams(
+                use_occlusion_accumulation=True,
+                use_temporal_consensus=True,
+            ),
+        )

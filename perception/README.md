@@ -34,6 +34,10 @@ changed and why.
   trustworthy free voxels; the established detector can then reject candidates
   that did not enter that space. This is a lightweight Python adaptation, not
   Dynablox's TSDF/Voxblox implementation.
+- `temporal_consensus.py` -- experimental multi-frame change vote adapted from
+  the historical evidence used by DOF-LIO and PGP-DOR. It can only reject
+  candidates from the established previous-frame detector; older frames never
+  introduce new candidates.
 - `cluster_response_node.py` / `response_policy.py` -- convert confirmed,
   current tracks into a time-debounced stop request, with stale-input
   handling. The ROS node publishes the request and status; the plain-numpy
@@ -397,6 +401,60 @@ Start a live screening run with:
 -p accumulate_scans:=1
 -p accumulate_stride:=1
 -p cluster_min_points:=5
+```
+
+### Experimental multi-frame change consensus
+
+`use_temporal_consensus` defaults to `False`. The established detector treats a
+point as changed when it has no neighbor within `change_threshold` in the
+immediately previous registered frame. DOF-LIO votes over several pose-aligned
+historical range images, while PGP-DOR compares points with several temporal
+neighbors before grid-level inference. The experiment in
+`temporal_consensus.py` adapts their shared idea to the existing world-frame
+nearest-neighbor representation.
+
+The implementation is deliberately monotonic: a point must first pass the
+normal previous-frame test, then it must also differ from a configured fraction
+of the available history. Older frames can reject a weak candidate that was
+missing from only one irregular Mid-360 scan, but cannot introduce a point the
+working detector considered static. Defaults use three histories and a 0.5
+ratio, i.e. two changed votes once the window is full. Timestamp rollback clears
+the window. The mode can also gate the free-space experiment, but is mutually
+exclusive with occlusion accumulation because that detector already defines its
+own temporal evidence.
+
+Screening results:
+
+| session | baseline moved / tracks | 2-of-3 moved / tracks | all-3 moved / tracks |
+|---|---:|---:|---:|
+| `walk_test` | 5,593 / 13 | 4,920 / 14 | 3,932 / 11 |
+| `fallback_dog2` | 3,894 / 7 | 3,650 / 7 | 3,310 / 6 |
+| aggregate `soton_indoor` | 797 / 2 | 719 / 2 | 653 / 2 |
+| one-scan `soton_indoor` | 7,514 / 1 | 7,363 / 1 | 5,305 / 1 |
+
+The safer 2-of-3 setting preserves both known aggregate tracks and all four
+measured rows of the known one-scan trajectory, but its candidate reduction is
+modest and track count does not improve consistently. The strict setting
+removes more candidates and reduces track counts on noisier sessions, but cuts
+the known one-scan trajectory from four measured rows to two. On `walk_test`,
+2-of-3 also produces one extra track despite accepting a strict subset of
+points: removing edge points can split one DBSCAN component into several. This
+is exactly the failure mode DOF-LIO's cluster-level recovery addresses, but
+that stage clusters the full nonground cloud. Without a validated
+gravity-aligned ground filter, applying it here could connect a person to the
+floor or nearby walls.
+
+Runtime remains inside the current budget: 2-of-3 adds roughly 1.6 ms/frame on
+the one-scan export and 2.5–5 ms/frame on the aggregate sessions on this
+laptop. There is still no labelled accuracy evidence for enabling it by
+default.
+
+Enable the safer screening configuration with:
+
+```text
+-p use_temporal_consensus:=true
+-p temporal_history_frames:=3
+-p temporal_min_changed_ratio:=0.5
 ```
 
 ## Testing against more recorded sessions

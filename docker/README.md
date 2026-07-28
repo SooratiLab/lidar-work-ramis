@@ -18,15 +18,16 @@ this), see the repo's internal notes for what's still open.
 Dockerfile                        image build: Livox-SDK2 + colcon workspace
 entrypoint.sh                     renders per-dog LiDAR config, dispatches launch
 patch_livox_timestamp.py          LiDAR/IMU timestamp fix, applied at build time
-docker-compose.yml                sensor, perception, response, actuation, replay, export, shared services
-.env.example                      copy to .env, set LIVOX_LIDAR_IP (and BAG_PATH for replay/export)
+docker-compose.yml                sensor, perception, response, actuation, record, replay, export, shared services
+.env.example                      copy to .env, set hardware, bag, and experiment values
 config/
   MID360_config.json.template     driver config with ${LIVOX_LIDAR_IP} etc.
   cyclonedds_eth0.xml              CycloneDDS wired-interface restriction
   fastrtps_eth0_only.xml           Fast DDS fallback multicast whitelist
 ```
 
-`docker-compose.yml` has four profiles:
+`docker-compose.yml` has five profiles; the optional `shared` profile is
+layered onto `hardware`:
 
 - **`hardware`** -- `driver` + `fastlio` + `perception` + `response` +
   `actuation`, for a real Mid-360 plugged into this Jetson. Actuation is a
@@ -34,6 +35,9 @@ config/
 - **`replay`** -- `fastlio` + `bag` plus the same perception/response/dry-run
   actuation path, for testing without a real sensor by replaying one of
   Kei's recorded bags. See `../perception/README.md`.
+- **`record`** -- a raw `/livox/lidar` + `/livox/imu` rosbag recorder to run
+  alongside `hardware`. Set `RECORD_OUTPUT_DIR` and give each capture a
+  unique `RECORD_NAME`; see `../FIELD_TEST_GUIDE.md`.
 - **`export`** -- `fastlio` + `bag` + `export`, for turning a bag into the
   `pcd/` + `poses.csv` layout `../evaluation/` expects, without a live
   ROS graph to watch or a separate node to run. See `../export/README.md`.
@@ -364,13 +368,15 @@ state to settle, then exercise a representative route during a five-minute
 capture:
 
 ```bash
-python3 benchmark_live.py --duration 300 --output benchmark-dog1-moving
+python3 benchmark_live.py --profile hardware --duration 300 \
+  --output benchmark-dog1-moving
 ```
 
 The collector uses only the Python standard library. It writes:
 
 - `summary.json`: perception frame count, mean/p50/p95/p99/max processing
-  time, real-time budget use, and warning count;
+  time, real-time budget use, moved-point/cluster/confirmed-track counts,
+  and warning count;
 - `topic-hz-*.txt`: raw input and FastLIO output rates;
 - `docker-stats.csv`: per-container CPU and memory once per second;
 - `tegrastats.txt`: Jetson clocks, temperatures, RAM, and power telemetry
@@ -379,6 +385,10 @@ The collector uses only the Python standard library. It writes:
 - response transition counts, stale-state entries, and dry-run/sent actuation
   counts in `summary.json`;
 - platform/version files and the exact container state.
+
+The same collector can compare detector configurations against an identical
+bag. Restart the replay profile from the beginning for each configuration,
+then use `--profile replay`; the field guide contains the recommended matrix.
 
 Use separate directories for at least three runs: stationary empty scene,
 stationary with a walker, and dog moving with a walker. Run the same route and

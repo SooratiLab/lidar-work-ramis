@@ -80,7 +80,8 @@ each subdirectory's README for exactly what has and hasn't been tested.
   of log excerpts. It also contains an opt-in A/B evaluator for an
   experimental temporal range-image occlusion accumulator adapted from Kim
   et al. (2025), a Dynablox-inspired sparse free-space history gate, plus an
-  A/B test for range-adaptive visibility tolerance.
+  A/B test for DOF-LIO/PGP-DOR-inspired multi-frame change consensus, plus a
+  range-adaptive visibility tolerance experiment.
   Aggregate-frame results remain negative, while a one-scan export found one
   promising persistent trajectory from the lightweight accumulator. The
   free-space gate preserved that export's known baseline trajectory and halved
@@ -125,6 +126,10 @@ each subdirectory's README for exactly what has and hasn't been tested.
   result, not a systematic one.
 
 ## Usage
+
+For a concise Jetson build check, live smoke test, raw-bag recording workflow,
+repeatable hardware/replay benchmarks, and recommended first field
+experiments, use [`FIELD_TEST_GUIDE.md`](FIELD_TEST_GUIDE.md).
 
 Two different workflows, depending on whether there's a sensor/bag
 involved at all:

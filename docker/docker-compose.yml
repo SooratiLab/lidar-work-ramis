@@ -73,6 +73,29 @@ services:
     depends_on:
       - fastlio
 
+  # Raw-data recorder for field experiments. It deliberately records only
+  # the sensor inputs so the same capture can be replayed through different
+  # FastLIO/perception settings without conflicting recorded output topics.
+  # Stop it with `docker compose --profile record stop -t 30 recorder` so
+  # rosbag2 receives SIGTERM and finishes metadata.yaml cleanly.
+  recorder:
+    image: go2-lidar-humble:latest
+    container_name: go2-bag-recorder
+    network_mode: host
+    environment:
+      <<: *dds-environment
+      RECORD_NAME: ${RECORD_NAME:-}
+    volumes:
+      - ${RECORD_OUTPUT_DIR:-../bags}:/bags:rw
+    command:
+      - bash
+      - -c
+      - >-
+        : "$${RECORD_NAME:?set a unique RECORD_NAME in .env}";
+        exec ros2 bag record -o "/bags/$${RECORD_NAME}"
+        /livox/lidar /livox/imu
+    profiles: ["record"]
+
   # Online perception prototype -- subscribes to /cloud_registered +
   # /Odometry live instead of batch-processing PCD files from disk. See
   # perception/README.md for what it does and doesn't do yet.
@@ -91,6 +114,14 @@ services:
       - "--ros-args"
       - "-p"
       - "use_occlusion_accumulation:=${USE_OCCLUSION_ACCUMULATION:-false}"
+      - "-p"
+      - "use_free_space_detection:=${USE_FREE_SPACE_DETECTION:-false}"
+      - "-p"
+      - "use_temporal_consensus:=${USE_TEMPORAL_CONSENSUS:-false}"
+      - "-p"
+      - "temporal_history_frames:=${TEMPORAL_HISTORY_FRAMES:-3}"
+      - "-p"
+      - "temporal_min_changed_ratio:=${TEMPORAL_MIN_CHANGED_RATIO:-0.5}"
       - "-p"
       - "accumulate_scans:=${PERCEPTION_ACCUMULATE_SCANS:-10}"
       - "-p"

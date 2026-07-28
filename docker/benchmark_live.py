@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Collect a repeatable live-pipeline benchmark on a Go2 Jetson.
+"""Collect a repeatable hardware or rosbag-pipeline benchmark.
 
-The hardware Docker profile must already be running.  This script deliberately
+The selected Docker profile must already be running.  This script deliberately
 runs on the host: Docker and tegrastats already expose the useful whole-system
 measurements there, without adding tools or overhead to the runtime image.
 """
@@ -18,13 +18,16 @@ import time
 from pathlib import Path
 
 
-CONTAINERS = (
-    "go2-lidar-driver",
+COMMON_CONTAINERS = (
     "go2-fastlio",
     "go2-online-perception",
     "go2-cluster-response",
     "go2-stop-actuation",
 )
+PROFILE_CONTAINERS = {
+    "hardware": ("go2-lidar-driver", *COMMON_CONTAINERS),
+    "replay": ("go2-bag-replay", *COMMON_CONTAINERS),
+}
 TOPICS = (
     "/livox/lidar",
     "/livox/imu",
@@ -34,6 +37,9 @@ TOPICS = (
     "/online_perception/stop_requested",
 )
 FRAME_RE = re.compile(r"dt=([0-9.]+)s, processed in ([0-9.]+)ms")
+FRAME_DETAIL_RE = re.compile(
+    r"frame \d+: (\d+) pts, (\d+) moved .*?, (\d+) clusters")
+TRACK_RE = re.compile(r"track (\d+) \[(new|matched|coasting|reidentified)\]")
 
 
 def run(command, *, timeout=None):
@@ -56,31 +62,39 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--duration", type=int, default=300,
                         help="measurement duration in seconds (default: 300)")
+    parser.add_argument(
+        "--profile", choices=sorted(PROFILE_CONTAINERS), default="hardware",
+        help="running Compose profile to measure (default: hardware)")
     parser.add_argument("--output", type=Path,
                         help="output directory (default: benchmark-<timestamp>)")
     return parser.parse_args()
 
 
-def require_live_stack():
+def require_live_stack(profile, containers):
     missing = []
-    for name in CONTAINERS:
+    for name in containers:
         result = run(["docker", "inspect", "-f", "{{.State.Running}}", name])
         if result.returncode != 0 or result.stdout.strip() != "true":
             missing.append(name)
     if missing:
-        print("The hardware profile is not ready; missing/running=false: " + ", ".join(missing),
+        print(f"The {profile} profile is not ready; missing/running=false: "
+              + ", ".join(missing),
               file=sys.stderr)
-        print("Start it with: docker compose --profile hardware up -d", file=sys.stderr)
+        print(f"Start it with: docker compose --profile {profile} up -d",
+              file=sys.stderr)
         raise SystemExit(2)
 
 
-def capture_platform(output_dir):
+def capture_platform(output_dir, containers, git_revision, git_status):
+    (output_dir / "git-revision.txt").write_text(
+        git_revision, encoding="utf-8")
+    (output_dir / "git-status.txt").write_text(git_status, encoding="utf-8")
     commands = {
         "date.txt": ["date", "--iso-8601=seconds"],
         "uname.txt": ["uname", "-a"],
         "docker-version.txt": ["docker", "version"],
         "docker-images.txt": ["docker", "images", "--digests", "go2-lidar-humble"],
-        "container-state.json": ["docker", "inspect", *CONTAINERS],
+        "container-state.json": ["docker", "inspect", *containers],
         "jetson-release.txt": ["bash", "-lc", "cat /etc/nv_tegra_release 2>/dev/null; dpkg-query -W nvidia-jetpack 2>/dev/null"],
         "power-mode.txt": ["nvpmodel", "-q"],
     }
@@ -115,7 +129,7 @@ def start_tegrastats(output_dir):
     return process, handle
 
 
-def sample_container_stats(duration, output_dir):
+def sample_container_stats(duration, output_dir, containers):
     deadline = time.monotonic() + duration
     path = output_dir / "docker-stats.csv"
     with path.open("w", newline="", encoding="utf-8") as stream:
@@ -124,7 +138,7 @@ def sample_container_stats(duration, output_dir):
         while time.monotonic() < deadline:
             result = run([
                 "docker", "stats", "--no-stream", "--format",
-                "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}", *CONTAINERS,
+                "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}", *containers,
             ], timeout=15)
             timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
             for line in result.stdout.splitlines():
@@ -149,7 +163,7 @@ def stop_process(item):
     handle.close()
 
 
-def summarize_perception(started_at, output_dir):
+def summarize_perception(started_at, output_dir, profile):
     since = started_at.astimezone(dt.timezone.utc).isoformat()
     result = run(["docker", "logs", "--since", since, "go2-online-perception"], timeout=30)
     (output_dir / "perception.log").write_text(result.stdout, encoding="utf-8")
@@ -163,7 +177,18 @@ def summarize_perception(started_at, output_dir):
         if frame_dt > 0:
             budget_fraction.append(elapsed_ms / (frame_dt * 1000.0))
 
+    frame_details = [
+        tuple(int(value) for value in match.groups())
+        for match in FRAME_DETAIL_RE.finditer(result.stdout)
+    ]
+    input_points = [values[0] for values in frame_details]
+    moved_points = [values[1] for values in frame_details]
+    cluster_counts = [values[2] for values in frame_details]
+    track_events = TRACK_RE.findall(result.stdout)
+    track_ids = {track_id for track_id, _ in track_events}
+
     summary = {
+        "profile": profile,
         "measured_frames": len(processing_ms),
         "processing_ms": {
             "mean": sum(processing_ms) / len(processing_ms) if processing_ms else None,
@@ -175,6 +200,23 @@ def summarize_perception(started_at, output_dir):
         "realtime_budget_percent": {
             "p95": percentile(budget_fraction, 0.95) * 100 if budget_fraction else None,
             "max": max(budget_fraction) * 100 if budget_fraction else None,
+        },
+        "detections": {
+            "frames_with_details": len(frame_details),
+            "input_points_mean": (
+                sum(input_points) / len(input_points) if input_points else None),
+            "moved_points_mean": (
+                sum(moved_points) / len(moved_points) if moved_points else None),
+            "moved_points_p95": percentile(moved_points, 0.95),
+            "clusters_total": sum(cluster_counts),
+            "frames_with_clusters": sum(value > 0 for value in cluster_counts),
+            "distinct_confirmed_track_ids": len(track_ids),
+            "confirmed_track_log_events": len(track_events),
+            "track_status_counts": {
+                status: sum(event_status == status
+                            for _, event_status in track_events)
+                for status in ("new", "matched", "coasting", "reidentified")
+            },
         },
         "warning_count": result.stdout.count("[WARN]"),
     }
@@ -218,17 +260,24 @@ def main():
     if shutil.which("docker") is None:
         raise SystemExit("docker is not installed or not on PATH")
 
-    require_live_stack()
+    containers = PROFILE_CONTAINERS[args.profile]
+    require_live_stack(args.profile, containers)
     started_at = dt.datetime.now().astimezone()
+    repo_root = Path(__file__).resolve().parent.parent
+    git_revision = run(
+        ["git", "-C", str(repo_root), "rev-parse", "HEAD"]).stdout
+    git_status = run(
+        ["git", "-C", str(repo_root), "status", "--short"]).stdout
     output_dir = args.output or Path(f"benchmark-{started_at.strftime('%Y%m%d-%H%M%S')}")
     output_dir.mkdir(parents=True, exist_ok=False)
-    capture_platform(output_dir)
+    capture_platform(
+        output_dir, containers, git_revision, git_status)
 
     print(f"Collecting {args.duration}s benchmark into {output_dir} ...")
     topic_processes = start_topic_monitors(args.duration, output_dir)
     tegrastats_process = start_tegrastats(output_dir)
     try:
-        sample_container_stats(args.duration, output_dir)
+        sample_container_stats(args.duration, output_dir, containers)
     except KeyboardInterrupt:
         print("Interrupted; keeping the partial benchmark.")
     finally:
@@ -236,7 +285,7 @@ def main():
             stop_process(item)
         stop_process(tegrastats_process)
 
-    summary = summarize_perception(started_at, output_dir)
+    summary = summarize_perception(started_at, output_dir, args.profile)
     capture_response_logs(started_at, output_dir, summary)
     print(json.dumps(summary, indent=2))
     if not summary["measured_frames"]:
