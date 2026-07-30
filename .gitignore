@@ -5,3 +5,7 @@ docker/.env
 
 data/
 output/
+
+# Ignore all non-readme local documentation files
+*.md
+!README.md
