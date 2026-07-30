@@ -4,8 +4,7 @@ Ports `kei-stuff/ros2-go2/scripts/export_fastlio.py` into a `docker-compose`
 service alongside this repo's own containerised Humble FastLIO
 (`../docker/`), so turning a new bag into `../evaluation/`'s expected
 `pcd/frame_*.pcd` + `poses.csv` layout no longer needs Kei's original
-three-terminal WSL2/Jazzy workflow
-(`kei-stuff/ros2-go2/laptop-wsl-setup.md`) on a second machine/ROS distro.
+three-terminal WSL2/Jazzy workflow on a second machine/ROS distro.
 Same subscriptions, same output format, same mm/m unit split as the
 original -- what changed is how it's run and how the PointCloud2 parsing
 itself works. See `export_fastlio.py`'s own module docstring for the full

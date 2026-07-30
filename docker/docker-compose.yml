@@ -65,9 +65,9 @@ services:
       # failure under :ro and it going away under :rw.
       - ${BAG_PATH:-.}:/bag:rw
     # Small delay so FastLIO's subscriber is up before the first message --
-    # matches the manual "wait for Node init finished" step in
-    # go2-jetson-setup.md; without it the bag's first IMU/LiDAR messages can
-    # arrive before FastLIO is subscribed and get silently dropped.
+    # matches the inherited manual "wait for Node init finished" step;
+    # without it the bag's first IMU/LiDAR messages can arrive before
+    # FastLIO is subscribed and get silently dropped.
     command: ["bash", "-c", "sleep 5 && ros2 bag play /bag"]
     profiles: ["replay", "export"]
     depends_on:
@@ -206,8 +206,8 @@ services:
     profiles: ["shared"]
 
   # Batch bag -> PCD/poses export -- the one-command replacement for Kei's
-  # original WSL2/Jazzy/export_fastlio.py workflow (kei-stuff/ros2-go2/
-  # laptop-wsl-setup.md), so a new bag can be turned into evaluation/'s
+  # original WSL2/Jazzy export_fastlio.py workflow, so a new bag can be
+  # turned into evaluation/'s
   # expected data/<session>/pcd/ + poses.csv layout without a second ROS
   # distro on a laptop. Separate profile from `replay` rather than folding
   # into it -- exporting and running the live perception node against the

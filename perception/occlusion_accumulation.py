@@ -2,8 +2,9 @@
 
 This module adapts the occlusion-accumulation idea described by Kim et al.,
 "Real-Time Moving Object Detection for 3-D LiDAR Using Occlusion
-Accumulation in Range Image" (IEEE TIM, 2025). See ``CITATIONS.md`` for the
-full citation and an explicit account of what is and is not reproduced here.
+Accumulation in Range Image" (IEEE Transactions on Instrumentation and
+Measurement, 2025). It is a project-specific adaptation, not a reproduction
+of the paper's full pipeline.
 
 Inputs are FastLIO-registered world-frame points and the corresponding sensor
 position, all in metres. The previous cloud is projected from the current

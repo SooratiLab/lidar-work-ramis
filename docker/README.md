@@ -1,8 +1,8 @@
 # go2-lidar-humble
 
 Containerised build of the Go2 Mid-360 LiDAR stack -- `livox_ros_driver2` +
-`FAST_LIO_ROS2` -- on ROS 2 Humble. Replaces the manual build steps in
-`ros2-go2/go2-jetson-setup.md` with a reproducible image: one `docker build`
+`FAST_LIO_ROS2` -- on ROS 2 Humble. Replaces the inherited manual setup
+workflow with a reproducible image: one `docker build`
 instead of cloning three repos, patching two of them by hand, and hoping the
 Livox SDK didn't end up in the wrong directory.
 
@@ -10,7 +10,7 @@ Built and tested on x86_64 as a stand-in for the Jetson's aarch64. Both the
 ROS base image and every upstream repo cloned in the `Dockerfile` support
 both architectures, so this should build unmodified on the Jetson -- not yet
 verified against real hardware (no Mid-360 or Jetson reachable while writing
-this), see the repo's internal notes for what's still open.
+this). The verified and still-open items are listed at the end of this README.
 
 ## What's in here
 
@@ -37,7 +37,7 @@ layered onto `hardware`:
   Kei's recorded bags. See `../perception/README.md`.
 - **`record`** -- a raw `/livox/lidar` + `/livox/imu` rosbag recorder to run
   alongside `hardware`. Set `RECORD_OUTPUT_DIR` and give each capture a
-  unique `RECORD_NAME`; see `../FIELD_TEST_GUIDE.md`.
+  unique `RECORD_NAME`.
 - **`export`** -- `fastlio` + `bag` + `export`, for turning a bag into the
   `pcd/` + `poses.csv` layout `../evaluation/` expects, without a live
   ROS graph to watch or a separate node to run. See `../export/README.md`.
@@ -193,10 +193,8 @@ ssh unitree@<wireless-or-tailscale-ip>
 ```
 
 Only continue when that succeeds. If the Jetson was reflashed and WiFi or
-Tailscale is not configured, stop here and complete the networking setup in
-the legacy
-[Go2 Jetson setup runbook](https://github.com/SooratiLab/ros2-go2/blob/main/go2-jetson-setup.md);
-otherwise swapping in the LiDAR cable will lock the laptop out.
+Tailscale is not configured, stop here and restore a working wireless SSH
+route; otherwise swapping in the LiDAR cable will lock the laptop out.
 
 ### 3. Fetch the GitHub code and pin what will be tested
 
@@ -252,11 +250,10 @@ ping -c 3 192.168.1.137         # Dog 2: 192.168.1.120
 ```
 
 Expected on `eth0`: `192.168.123.18/24` and `192.168.1.50/24`. There should
-not be a `default via 192.168.123.1` route. If either is wrong, fix the Jetson
-netplan using sections 4 and 7 of the
-[Go2 Jetson setup runbook](https://github.com/SooratiLab/ros2-go2/blob/main/go2-jetson-setup.md)
-before debugging Docker. A failed LiDAR ping is likewise a
-cable/address/network problem, not a perception problem.
+not be a `default via 192.168.123.1` route. If either is wrong, fix the
+Jetson's persistent netplan configuration before debugging Docker. A failed
+LiDAR ping is likewise a cable/address/network problem, not a perception
+problem.
 
 Also confirm the system clock is credible with `date --iso-8601=seconds`;
 incorrect clocks make logs and comparisons hard to reconcile. The image does

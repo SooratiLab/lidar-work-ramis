@@ -1,6 +1,6 @@
 # ROS 2 Humble image for the Go2 Mid-360 LiDAR stack: livox_ros_driver2 +
 # FAST_LIO_ROS2. Replaces the manual, many-pitfalls build-from-scratch
-# workflow in ros2-go2/go2-jetson-setup.md with a reproducible image.
+# workflow inherited from ros2-go2 with a reproducible image.
 #
 # Built and tested on x86_64 as a stand-in for the Jetson's aarch64 -- ROS's
 # own Humble base images and every upstream repo cloned below support both
@@ -26,8 +26,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ---------------------------------------------------------------------------
 # Livox-SDK2 -- built and installed system-wide, outside the colcon
 # workspace. If it ends up under ros2_ws/src instead, colcon tries to build
-# it as a ROS package alongside livox_ros_driver2 and both builds fail (see
-# go2-jetson-setup.md section 9.1 for the Foxy-era version of this mistake).
+# it as a ROS package alongside livox_ros_driver2 and both builds fail. This
+# reproduces a failure already encountered in the inherited Foxy setup.
 # ---------------------------------------------------------------------------
 RUN git clone --depth 1 https://github.com/Livox-SDK/Livox-SDK2.git /opt/Livox-SDK2 \
     && cmake -S /opt/Livox-SDK2 -B /opt/Livox-SDK2/build -DCMAKE_BUILD_TYPE=Release \
@@ -70,11 +70,11 @@ RUN git init /tmp/unitree_ros2 \
 COPY patch_livox_timestamp.py /tmp/patch_livox_timestamp.py
 RUN python3 /tmp/patch_livox_timestamp.py /opt/ros2_ws/src/livox_ros_driver2
 
-# The ConstSharedPtr -> SharedPtr laserMapping.cpp patch documented in
-# go2-jetson-setup.md section 9.5 is a Foxy-only workaround: Ericsii's fork
-# is written against Humble's AnyServiceCallback API (ConstSharedPtr), which
-# Foxy's older API doesn't accept. On Humble the upstream source is already
-# correct as cloned -- deliberately not patching it here.
+# The inherited ConstSharedPtr -> SharedPtr laserMapping.cpp patch is a
+# Foxy-only workaround: Ericsii's fork is written against Humble's
+# AnyServiceCallback API (ConstSharedPtr), which Foxy's older API doesn't
+# accept. On Humble the upstream source is already correct as cloned --
+# deliberately not patching it here.
 
 RUN rosdep init 2>/dev/null || true && rosdep update --rosdistro humble
 # apt's package index was dropped after the first apt-get layer above to

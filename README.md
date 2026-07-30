@@ -7,9 +7,8 @@ week Summer Internship at the University of Southampton, supervised by
 Dr. Mohammad Soorati.
 
 Research papers, algorithms, scientific software, standards, and inherited
-project work used here are tracked in [`CITATIONS.md`](CITATIONS.md), including
-the relationship between each source and this implementation. Reusable search
-queries for finding related work are grouped in [`keywords.md`](keywords.md).
+project work are attributed alongside the relevant implementation and
+discussion, including how each source relates to the code used here.
 
 ## Background
 
@@ -89,8 +88,7 @@ each subdirectory's README for exactly what has and hasn't been tested.
   Guarded, default-off live modes exist for physical testing only and refuse
   invalid ten-scan configurations. See `evaluation/README.md`.
 - **`export/`** -- ports Kei's `export_fastlio.py` (originally a manual
-  step in a three-terminal WSL2/Jazzy workflow, see
-  `kei-stuff/ros2-go2/laptop-wsl-setup.md`) into a `docker-compose`
+  step in a three-terminal WSL2/Jazzy workflow) into a `docker-compose`
   service alongside this repo's own containerised Humble FastLIO, so
   turning a new bag into `evaluation/`'s expected `pcd/` + `poses.csv`
   layout no longer needs a second OS/ROS distro on a laptop. Verified end
@@ -127,9 +125,9 @@ each subdirectory's README for exactly what has and hasn't been tested.
 
 ## Usage
 
-For a concise Jetson build check, live smoke test, raw-bag recording workflow,
-repeatable hardware/replay benchmarks, and recommended first field
-experiments, use [`FIELD_TEST_GUIDE.md`](FIELD_TEST_GUIDE.md).
+For the Jetson build check, live smoke test, hardware/replay benchmarks, and
+recommended first field checks, use the first-live-run workflow in
+`docker/README.md`.
 
 Two different workflows, depending on whether there's a sensor/bag
 involved at all:

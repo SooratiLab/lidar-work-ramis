@@ -42,8 +42,9 @@ point counts, confirmed IDs, first-confirmed frame, runtime, and accumulator
 pixel diagnostics. These are screening measurements, not accuracy metrics:
 the recordings have no pointwise moving/static ground truth.
 
-The implementation adapts Kim et al.'s 2025 occlusion-accumulation paper; see
-`../CITATIONS.md` for the citation and precise implementation differences.
+The implementation adapts Kim et al.'s 2025 paper, "Real-Time Moving Object
+Detection for 3-D LiDAR Using Occlusion Accumulation in Range Image"
+(IEEE Transactions on Instrumentation and Measurement).
 The first implementation retained weak sub-threshold differences across
 frames. Reviewing the paper's equations showed that its truncation instead
 sets evidence below `alpha * range` to zero on every sequence; otherwise small
@@ -119,8 +120,9 @@ It writes `baseline_tracks.csv`, `free_space_tracks.csv`, and `summary.json`
 under `output/<session>-free-space-comparison/`. The experiment casts rays
 through registered one-scan clouds, promotes repeatedly observed free voxels,
 and requires established moving-point candidates to intrude into that map.
-This is not the cloned Dynablox TSDF/Voxblox stack; see `../CITATIONS.md` and
-`../perception/free_space.py` for the precise relationship.
+This is not the cloned Dynablox TSDF/Voxblox stack: it adapts only the central
+free-space-intrusion cue as a lightweight sparse Python history. See
+`../perception/free_space.py` for the implementation.
 
 The 242-frame one-scan `soton_indoor` screening retained the baseline's one
 known trajectory with the same four measured rows and first confirmation at

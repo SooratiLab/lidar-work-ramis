@@ -7,8 +7,8 @@ Ported from kei-stuff/ros2-go2/scripts/export_fastlio.py. rclpy's Node/
 subscription API hasn't changed between Foxy, Humble, and Jazzy, so the
 port itself needed no ROS-version-specific changes -- what changed is how
 it's run: Kei's version was a manual step in a three-terminal WSL2/Jazzy
-workflow (see kei-stuff/ros2-go2/laptop-wsl-setup.md); this one runs as a
-docker-compose service (../docker/docker-compose.yml's `export` service)
+workflow; this one runs as a docker-compose service
+(../docker/docker-compose.yml's `export` service)
 alongside the same containerised Humble FastLIO this repo's `docker/`
 already builds, so exporting a new bag no longer needs a second OS/ROS
 distro on a laptop. See ../docker/README.md for the one-command version and
@@ -53,10 +53,9 @@ Notes:
       units"). Point clouds are scaled x1000 before writing. Poses stay in
       metres -- they encode the robot trajectory, not point coordinates,
       and evaluation/ and perception/ both expect FastLIO's own metre
-      convention there. This mm/m split is the exact gotcha AGENTS.md
-      flags as having caused real confusion once already -- don't
-      "simplify" it to one unit without updating every downstream reader
-      of these files' units at the same time.
+      convention there. This mm/m split has caused real confusion before;
+      don't "simplify" it to one unit without updating every downstream
+      reader of these files' units at the same time.
     - Each /cloud_registered message becomes one accumulated frame once
       --accumulate scans have arrived. At ~10 Hz, --accumulate 10 gives
       ~1-second frames, matching evaluation/'s and perception/'s own

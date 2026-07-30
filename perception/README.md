@@ -27,8 +27,8 @@ changed and why.
 - `occlusion_accumulation.py` -- experimental pose-compensated temporal
   range-image detector adapted from Kim et al. (2025). It is used only by
   the offline A/B evaluator, not the live node; see
-  `../evaluation/README.md` for the mixed initial result and
-  `../CITATIONS.md` for technical attribution.
+  `../evaluation/README.md` for the technical background and mixed initial
+  result.
 - `free_space.py` -- experimental sparse free-space history adapted from
   Dynablox's central motion cue. Repeated pose-aligned rays establish
   trustworthy free voxels; the established detector can then reject candidates
