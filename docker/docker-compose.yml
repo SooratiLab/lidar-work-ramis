@@ -1,7 +1,7 @@
 x-dds-environment: &dds-environment
-  # Fast DDS is the live-verified Dog 2 path. Switch explicitly to CycloneDDS
-  # only after rebuilding an image that passes the runtime-library check.
-  RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
+  # CycloneDDS matches Unitree's SDK and is live-verified with the Mid-360 on
+  # Dog 2. Fast DDS remains available through an environment override.
+  RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
   CYCLONEDDS_URI: ${CYCLONEDDS_URI:-file:///opt/cyclonedds_eth0.xml}
   FASTRTPS_DEFAULT_PROFILES_FILE: /opt/fastrtps_eth0_only.xml
 

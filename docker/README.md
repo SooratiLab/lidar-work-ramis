@@ -6,12 +6,10 @@ workflow with a reproducible image: one `docker build`
 instead of cloning three repos, patching two of them by hand, and hoping the
 Livox SDK didn't end up in the wrong directory.
 
-The complete Humble stack has now run on Dog 2's Jetson against a physical
-Mid-360. Fast DDS is the verified live middleware. CycloneDDS works in replay
-on the development machine, but the older image currently deployed to Dog 2
-predates its runtime package; rebuild the current Dockerfile before attempting
-the live Cyclone comparison. The verified and still-open items are listed at
-the end of this README.
+The complete Humble stack has run on Dog 2's Jetson against a physical
+Mid-360 with both CycloneDDS and Fast DDS. CycloneDDS is the default because
+it matches Unitree's SDK middleware; Fast DDS remains a tested fallback. The
+verified and still-open items are listed at the end of this README.
 
 ## What's in here
 
@@ -82,8 +80,12 @@ Host networking isn't a convenience here, it's required.
 
 The actuation adapter is a dry run while `.env` contains
 `ACTUATION_ENABLED=false` (the shipped default). It logs
-`would_send_stop_move` but cannot publish `/api/sport/request`. Do not change
-this setting until the stationary checklist below passes.
+`would_send_stop_move`, creates no Unitree command publisher, and sends no
+messages. CycloneDDS can still show `/api/sport/request` because native Unitree
+services already expose endpoints on that topic; topic presence alone does not
+show that this adapter is enabled. Check its resolved `enabled:=false` command
+and startup log instead. Do not change this setting until the stationary
+checklist below passes.
 
 To run just one piece:
 
@@ -282,10 +284,9 @@ nano .env                       # set LIVOX_LIDAR_IP; host IP is normally unchan
 docker compose --profile hardware build
 ```
 
-Keep `RMW_IMPLEMENTATION=rmw_fastrtps_cpp` for the first live benchmarks; it
-is the verified Dog 2 path. Test CycloneDDS separately after the rebuilt image
-passes the library check, rather than changing middleware during a detector
-comparison.
+Keep `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` for the baseline matrix. Do not
+change middleware between detector comparisons; use the documented Fast DDS
+fallback only for diagnosis or an explicit middleware comparison.
 
 Before starting containers, make Compose show the resolved configuration and
 check that the selected LiDAR address is exactly the intended physical unit:
@@ -415,6 +416,73 @@ Use names that cannot be confused later, for example
 `benchmark-20260721-dog1-moving-walker`. The output directory must not already
 exist. During the first two runs leave the dog stationary; for the moving run,
 use the controller normally and have a second person walk the agreed route.
+
+### Field capture matrix
+
+Collect the four baseline scenes with the same detector configuration, site,
+route, five-minute duration, and power mode. Record raw LiDAR and IMU for every
+scene so detector changes can be compared later against identical input.
+
+| Scene suffix | Procedure | Primary question |
+|---|---|---|
+| `stationary-empty` | Dog stands still; keep people and moving objects out of view. | What is the static false-positive and resource baseline? |
+| `moving-empty` | Walk a fixed route with straight sections, turns, a stop, and a restart; nobody crosses nearby. | Does ego-motion or FastLIO resettling create false tracks? |
+| `stationary-walker` | Dog stands still; one person approaches from about 5 m, crosses at 1.5-2 m, pauses, retreats, then leaves the view. | Are detection, track persistence, stop dwell, and clear behaviour plausible? |
+| `moving-walker` | Repeat the fixed dog route while a second person performs the same crossing. | Does the complete pipeline remain usable when both viewpoint and obstacle move? |
+
+Run `stationary-empty` first and `moving-walker` last. The moving scenes need
+one controller operator and, for `moving-walker`, a separate walker. Keep
+actuation disabled for this matrix. Write down the UTC start time, site,
+weather, route, operator cues, unusual interruptions, and whether the LiDAR
+mount moved. A phone video including the spoken start cue makes fragmented or
+late tracks much easier to interpret afterward.
+
+Use a fresh name for each take. The following commands start only the raw bag
+recorder; the hardware profile should already be healthy and running:
+
+```bash
+cd ~/lidar-work-ramis/docker
+RUN_NAME=20260807-dog2-stationary-empty-r01
+mkdir -p /home/unitree/lidar-bags
+
+RMW_IMPLEMENTATION=rmw_cyclonedds_cpp \
+RECORD_OUTPUT_DIR=/home/unitree/lidar-bags \
+RECORD_NAME="$RUN_NAME" \
+docker compose --profile record up -d --force-recreate recorder
+
+docker compose --profile record ps recorder
+docker logs --tail 20 go2-bag-recorder
+```
+
+Start the matching benchmark immediately after the recorder in a second SSH
+window. Its output belongs beside the bag evidence, but it is not itself a
+rosbag:
+
+```bash
+cd ~/lidar-work-ramis/docker
+RUN_NAME=20260807-dog2-stationary-empty-r01
+python3 benchmark_live.py --profile hardware --duration 300 \
+  --output "benchmark-$RUN_NAME"
+```
+
+Stop the recorder gracefully after the benchmark finishes. Do not use
+`docker kill`: rosbag2 needs the normal stop interval to finish
+`metadata.yaml`.
+
+```bash
+cd ~/lidar-work-ramis/docker
+RUN_NAME=20260807-dog2-stationary-empty-r01
+docker compose --profile record stop -t 30 recorder
+docker compose --profile record rm -f recorder
+
+test -s "/home/unitree/lidar-bags/$RUN_NAME/metadata.yaml"
+du -sh "/home/unitree/lidar-bags/$RUN_NAME"
+```
+
+`RUN_NAME` is a shell variable. Set it to the same value again if the stop or
+verification commands are run from a new terminal. Leave the hardware profile
+running between comparable takes. Run `docker compose --profile hardware down`
+after the final scene.
 
 For reproducible maximum-performance numbers, record the current power mode
 with `sudo nvpmodel -q`; optionally select the lab-approved maximum-power mode
@@ -594,28 +662,23 @@ Verified so far, by actually running it, not just building it:
   ten-scan frame per second at 27.0 ms mean and 35.2 ms p95 with no clusters,
   warnings, stale response state, or command publication.
 
-Not yet verified: whether CycloneDDS works on the Go2 Jetson and whether the
-current image builds natively from scratch there. The first live Cyclone
-attempt used a stale image without `librmw_cyclonedds_cpp.so`, so it failed
-before node creation and says nothing about middleware compatibility. Rebuild
-the current Dockerfile, run the library check above, then repeat the four-rate
-and five-minute tests. Fast DDS remains the known-good fallback.
+- The current image builds natively from scratch on Dog 2's ARM64 Jetson and
+  contains `librmw_cyclonedds_cpp.so`. With CycloneDDS, raw LiDAR held
+  9.997 Hz, IMU 200 Hz, registered cloud 10.014 Hz, odometry 10.014 Hz, and
+  both perception outputs 0.999 Hz. All five services remained running with
+  zero restarts. The disabled adapter logged dry-run actions only. Native
+  Unitree DDS endpoints became visible on `/api/sport/request`, as expected
+  when using the same middleware, but the adapter created no publisher.
 
-Whether this container can run *live*, right now, on a Jetson that hasn't
-been reflashed yet (still JetPack 5.1.x/Ubuntu 20.04/Foxy) rather than
-waiting for the JetPack 6 reflash is a separate, related question with its
-own reasoning and open items -- see the repo's internal notes' "Can the
-Humble container actually run live on a Jetson without reflashing?"
-section (short answer: architecturally yes, this is exactly why it's a
-container and not a patch script, but three concrete things -- Docker
-actually present on the Jetson, an aarch64 build, and the segfault
-question re-tested from inside a container -- are still unconfirmed
-either way).
-CycloneDDS is the default. Rebuild after pulling this change so the image
-contains Humble's CycloneDDS RMW implementation:
+The live Cyclone check establishes compatibility and normal short-run rates.
+A five-minute benchmark and a controlled moving-dog capture remain necessary
+to compare resource trends and ego-motion behaviour against Fast DDS.
+
+CycloneDDS is the default. Rebuild after pulling changes that affect the image
+so it contains Humble's CycloneDDS RMW implementation:
 
 ```bash
-docker compose build
+docker compose --profile hardware build
 docker compose --profile hardware up -d
 ```
 
@@ -642,8 +705,7 @@ RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
 The existing Fast DDS Ethernet whitelist remains in the image and is selected
 automatically by `FASTRTPS_DEFAULT_PROFILES_FILE`. Use the same environment
 prefix on later `docker compose` commands for that session, or put
-`RMW_IMPLEMENTATION=rmw_fastrtps_cpp` in `.env` until the CycloneDDS issue is
-understood.
+`RMW_IMPLEMENTATION=rmw_fastrtps_cpp` in `.env` for a persistent fallback.
 
 The CycloneDDS file intentionally names the Go2 Jetson's `eth0`. For replay on
 a development computer whose active interface has another name, override the
