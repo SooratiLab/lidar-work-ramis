@@ -36,6 +36,10 @@ TOPICS = (
     "/online_perception/tracks",
     "/online_perception/stop_requested",
 )
+ROS_SETUP = (
+    "source /opt/ros/humble/setup.bash && "
+    "source /opt/ros2_ws/install/setup.bash"
+)
 FRAME_RE = re.compile(r"dt=([0-9.]+)s, processed in ([0-9.]+)ms")
 FRAME_DETAIL_RE = re.compile(
     r"frame \d+: (\d+) pts, (\d+) moved .*?, (\d+) clusters")
@@ -112,7 +116,9 @@ def start_topic_monitors(duration, output_dir):
         handle = (output_dir / f"topic-hz-{safe_name}.txt").open("w", encoding="utf-8")
         command = [
             "docker", "exec", "go2-fastlio", "bash", "-lc",
-            f"timeout {duration}s ros2 topic hz {topic}",
+            # docker exec starts a new process without running the image
+            # entrypoint, so it must source ROS and the workspace itself.
+            f"{ROS_SETUP} && timeout {duration}s ros2 topic hz {topic}",
         ]
         process = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT, text=True)
         processes.append((process, handle))
