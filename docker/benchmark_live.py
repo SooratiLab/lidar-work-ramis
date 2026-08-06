@@ -40,6 +40,7 @@ ROS_SETUP = (
     "source /opt/ros/humble/setup.bash && "
     "source /opt/ros2_ws/install/setup.bash"
 )
+FASTLIO_CONFIG = "/opt/fastlio-config/mid360.yaml"
 FRAME_RE = re.compile(r"dt=([0-9.]+)s, processed in ([0-9.]+)ms")
 FRAME_DETAIL_RE = re.compile(
     r"frame \d+: (\d+) pts, (\d+) moved .*?, (\d+) clusters")
@@ -86,6 +87,21 @@ def require_live_stack(profile, containers):
               file=sys.stderr)
         print(f"Start it with: docker compose --profile {profile} up -d",
               file=sys.stderr)
+        raise SystemExit(2)
+
+
+def require_bounded_fastlio_config():
+    result = run([
+        "docker", "exec", "go2-fastlio", "bash", "-lc",
+        "grep -Eq '^[[:space:]]*pcd_save_en:[[:space:]]*false"
+        f"([[:space:]]*(#.*)?)?$' {FASTLIO_CONFIG}",
+    ], timeout=10)
+    if result.returncode != 0:
+        print(
+            "FastLIO is not using the bounded live configuration with "
+            "pcd_save_en=false; refusing to benchmark an unbounded mapper.",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
 
 
@@ -268,6 +284,7 @@ def main():
 
     containers = PROFILE_CONTAINERS[args.profile]
     require_live_stack(args.profile, containers)
+    require_bounded_fastlio_config()
     started_at = dt.datetime.now().astimezone()
     repo_root = Path(__file__).resolve().parent.parent
     git_revision = run(

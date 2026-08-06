@@ -6,11 +6,12 @@ workflow with a reproducible image: one `docker build`
 instead of cloning three repos, patching two of them by hand, and hoping the
 Livox SDK didn't end up in the wrong directory.
 
-Built and tested on x86_64 as a stand-in for the Jetson's aarch64. Both the
-ROS base image and every upstream repo cloned in the `Dockerfile` support
-both architectures, so this should build unmodified on the Jetson -- not yet
-verified against real hardware (no Mid-360 or Jetson reachable while writing
-this). The verified and still-open items are listed at the end of this README.
+The complete Humble stack has now run on Dog 2's Jetson against a physical
+Mid-360. Fast DDS is the verified live middleware. CycloneDDS works in replay
+on the development machine, but the older image currently deployed to Dog 2
+predates its runtime package; rebuild the current Dockerfile before attempting
+the live Cyclone comparison. The verified and still-open items are listed at
+the end of this README.
 
 ## What's in here
 
@@ -22,6 +23,7 @@ docker-compose.yml                sensor, perception, response, actuation, recor
 .env.example                      copy to .env, set hardware, bag, and experiment values
 config/
   MID360_config.json.template     driver config with ${LIVOX_LIDAR_IP} etc.
+  mid360.yaml                     repository-owned live FastLIO parameters
   cyclonedds_eth0.xml              CycloneDDS wired-interface restriction
   fastrtps_eth0_only.xml           Fast DDS fallback multicast whitelist
 ```
@@ -55,6 +57,11 @@ error, which is easy to miss).
 
 ```bash
 docker compose --profile hardware build
+
+# Catch a stale image before Compose turns a missing middleware library into
+# a restart loop. The current Dockerfile installs this file.
+docker run --rm --entrypoint bash go2-lidar-humble:latest \
+  -lc 'test -r /opt/ros/humble/lib/librmw_cyclonedds_cpp.so'
 ```
 
 ## Run
@@ -275,6 +282,11 @@ nano .env                       # set LIVOX_LIDAR_IP; host IP is normally unchan
 docker compose --profile hardware build
 ```
 
+Keep `RMW_IMPLEMENTATION=rmw_fastrtps_cpp` for the first live benchmarks; it
+is the verified Dog 2 path. Test CycloneDDS separately after the rebuilt image
+passes the library check, rather than changing middleware during a detector
+comparison.
+
 Before starting containers, make Compose show the resolved configuration and
 check that the selected LiDAR address is exactly the intended physical unit:
 
@@ -382,6 +394,11 @@ The collector uses only the Python standard library. It writes:
 - response transition counts, stale-state entries, and dry-run/sent actuation
   counts in `summary.json`;
 - platform/version files and the exact container state.
+
+The live FastLIO configuration disables PCD saving. Upstream's default keeps
+every registered point until shutdown and can eventually exhaust Jetson RAM;
+use the bounded raw-bag recorder and the replay/export profiles when a durable
+capture or PCD export is required.
 
 The same collector can compare detector configurations against an identical
 bag. Restart the replay profile from the beginning for each configuration,
@@ -571,12 +588,18 @@ Verified so far, by actually running it, not just building it:
   processed all 24 accumulated frames, reproduced the two persistent tracks,
   and averaged 10.5 ms per processed frame. This verifies the Humble replay
   path, not the Go2 Jetson or native Unitree DDS topics.
+- Dog 2's physical Mid-360 publishes 20,064-point scans at 10 Hz and IMU at
+  200 Hz through this stack. FastLIO cloud and odometry settle near 10 Hz
+  after startup, and the first stationary live benchmark processed one
+  ten-scan frame per second at 27.0 ms mean and 35.2 ms p95 with no clusters,
+  warnings, stale response state, or command publication.
 
-Not yet verified: an actual Mid-360 talking to this container, an actual
-Jetson build, and whether CycloneDDS's node-creation segfault (which forced
-Fast DDS on the Foxy setup this replaces) still happens on Humble. CycloneDDS
-is now the default live-test path; Fast DDS remains an environment-variable
-fallback because it is already known to work.
+Not yet verified: whether CycloneDDS works on the Go2 Jetson and whether the
+current image builds natively from scratch there. The first live Cyclone
+attempt used a stale image without `librmw_cyclonedds_cpp.so`, so it failed
+before node creation and says nothing about middleware compatibility. Rebuild
+the current Dockerfile, run the library check above, then repeat the four-rate
+and five-minute tests. Fast DDS remains the known-good fallback.
 
 Whether this container can run *live*, right now, on a Jetson that hasn't
 been reflashed yet (still JetPack 5.1.x/Ubuntu 20.04/Foxy) rather than

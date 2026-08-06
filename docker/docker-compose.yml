@@ -1,5 +1,7 @@
 x-dds-environment: &dds-environment
-  RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_cyclonedds_cpp}
+  # Fast DDS is the live-verified Dog 2 path. Switch explicitly to CycloneDDS
+  # only after rebuilding an image that passes the runtime-library check.
+  RMW_IMPLEMENTATION: ${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
   CYCLONEDDS_URI: ${CYCLONEDDS_URI:-file:///opt/cyclonedds_eth0.xml}
   FASTRTPS_DEFAULT_PROFILES_FILE: /opt/fastrtps_eth0_only.xml
 
@@ -34,7 +36,19 @@ services:
     container_name: go2-fastlio
     network_mode: host
     environment: *dds-environment
-    command: ["fastlio"]
+    volumes:
+      - ./config/mid360.yaml:/opt/fastlio-config/mid360.yaml:ro
+    # Use the repository-owned live configuration without rebuilding the
+    # image. In particular, this disables upstream's unlimited PCD retention,
+    # which otherwise grows until the mapper exits or exhausts memory.
+    command:
+      - ros2
+      - launch
+      - fast_lio
+      - mapping.launch.py
+      - config_path:=/opt/fastlio-config
+      - config_file:=mid360.yaml
+      - rviz:=false
     restart: unless-stopped
     profiles: ["hardware", "replay", "export"]
 
